@@ -1,0 +1,35 @@
+annotated-types
+anyio
+certifi
+colorama
+distro
+h11
+httpcore
+httpx
+idna
+jiter
+openai
+pydantic
+pydantic_core
+python-dotenv
+sniffio
+tqdm
+typing-inspection
+typing_extensions
+pillow
+rich
+requests
+
+# fastapi
+# uvicorn
+# python-multipart
+# sqlalchemy
+# passlib[bcrypt]
+# python-jose[cryptography]
+# aspose-words
+# openai
+# python-dotenv
+# pydantic[email]
+# translitua
+# rich
+# asyncio

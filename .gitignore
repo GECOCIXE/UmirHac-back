@@ -1,0 +1,6 @@
+*.umir_venv/
+*__pycache__/
+*/users_data/*
+.env
+umir_db.sqlite
+jumaisynba_script.json
