@@ -20,14 +20,3 @@ pillow
 rich
 requests
 python-jose[cryptography]
-
-# fastapi
-# uvicorn
-# python-multipart
-# sqlalchemy
-# passlib[bcrypt]
-# aspose-words
-# openai
-# python-dotenv
-# pydantic[email]
-# translitua
