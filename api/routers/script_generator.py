@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, Query
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any, Set
 import os
 import json
 import base64
@@ -13,6 +14,9 @@ from PIL import Image
 import io
 import threading
 import time
+import mimetypes
+import base64
+from pathlib import Path
 
 from deep_translator import GoogleTranslator
 
@@ -28,6 +32,46 @@ router = APIRouter(
     tags=["script-generator"],
     dependencies=[Depends(security)]
 )
+
+class BlocksImagesRequest(BaseModel):
+    block_indices: List[int]
+
+class ScenarioBlock(BaseModel):
+    type: str
+    content: Dict[str, Any]
+    formatting: Dict[str, Any]
+    index: Optional[int] = None  # если None — бэкенд выдаст новый index
+
+class EditImageForBlockRequest(BaseModel):
+    project_id: int
+    block_index: int  # Индекс блока в сценарии (1-нумерация)
+    use_block_prompt: bool = True
+    custom_prompt: Optional[str] = None
+
+class ScenarioBlockCreate(BaseModel):
+    """
+    Модель для создания нового блока сценария.
+    index не передаём — его выдаёт бэкенд.
+    """
+    type: str
+    content: Dict[str, Any]
+    formatting: Dict[str, Any]
+
+
+class ScenarioBlockUpdate(BaseModel):
+    """
+    Модель для частичного обновления блока.
+    Можно прислать только то, что меняется.
+    """
+    type: Optional[str] = None
+    content: Optional[Dict[str, Any]] = None
+    formatting: Optional[Dict[str, Any]] = None
+
+
+class ScenarioUpdateRequest(BaseModel):
+    product_description: Optional[str] = None
+    original_blocks_count: Optional[int] = None
+    blocks: List[ScenarioBlock]
 
 # Модели Pydantic для запросов и ответов
 class GenerateScriptRequest(BaseModel):
@@ -63,7 +107,6 @@ class EditImageForBlockRequest(BaseModel):
     use_block_prompt: bool = True  # Если True, использовать промт из блока, иначе - использовать custom_prompt
     custom_prompt: Optional[str] = None  # Пользовательский промт, если use_block_prompt = False
 
-from typing import List, Dict, Any
 
 class ImagePathData(BaseModel):
     index: int
@@ -86,11 +129,145 @@ class ProjectStatusResponse(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
     result_path: Optional[str] = None
+    image_path: Optional[str] = None  # Legacy field
+    image_description: Optional[str] = None  # Legacy field
     product_description: Optional[str] = None
     # New structured fields for multiple images
     image_generation_status: Optional[List[ImageGenerationStatus]] = None
     image_paths: Optional[List[ImagePathData]] = None
     image_descriptions: Optional[List[ImageDescriptionData]] = None
+    
+class ScenarioReorderRequest(BaseModel):
+    # список старых index блоков в новом порядке
+    new_order: List[int]
+
+
+def _remap_indices_for_images(project: Project, index_map: Dict[int, int], db: Session):
+    """
+    Перекидывает индексы картинок и статусов по произвольному отображению:
+    old_index -> new_index.
+    Используется при полном reorder блоков.
+    """
+    if not index_map:
+        return
+
+    # 1. ScenarioElementImage
+    images = db.query(ScenarioElementImage).filter(
+        ScenarioElementImage.project_id == project.id
+    ).all()
+
+    for img in images:
+        old_idx = img.element_index
+        if old_idx in index_map:
+            img.element_index = index_map[old_idx]
+
+    # 2. JSON-поля проекта
+    def _remap_json(field_value: Optional[str]) -> Optional[str]:
+        if not field_value:
+            return field_value
+        try:
+            data = json.loads(field_value)
+        except (json.JSONDecodeError, TypeError):
+            return field_value
+
+        blocks = data.get("blocks")
+        if not isinstance(blocks, list):
+            return field_value
+
+        for b in blocks:
+            idx = b.get("index")
+            if isinstance(idx, int) and idx in index_map:
+                b["index"] = index_map[idx]
+
+        return json.dumps(data, ensure_ascii=False)
+
+    project.image_paths = _remap_json(project.image_paths)
+    project.image_descriptions = _remap_json(project.image_descriptions)
+    project.image_generation_status = _remap_json(project.image_generation_status)
+
+def _shift_indices_for_images(project: Project, start_index: int, delta: int, db: Session):
+    """
+    Смещает индексы для всех блоков >= start_index на delta
+    и в БД, и в JSON-полях проекта.
+    Используется при вставке/удалении блоков.
+    """
+    if delta == 0:
+        return
+
+    # 1. ScenarioElementImage
+    images = db.query(ScenarioElementImage).filter(
+        ScenarioElementImage.project_id == project.id,
+        ScenarioElementImage.element_index >= start_index,
+    ).all()
+
+    for img in images:
+        img.element_index = img.element_index + delta
+
+    # 2. JSON-поля проекта
+    def _shift_json(field_value: Optional[str]) -> Optional[str]:
+        if not field_value:
+            return field_value
+        try:
+            data = json.loads(field_value)
+        except (json.JSONDecodeError, TypeError):
+            return field_value
+
+        blocks = data.get("blocks")
+        if not isinstance(blocks, list):
+            return field_value
+
+        for b in blocks:
+            idx = b.get("index")
+            if isinstance(idx, int) and idx >= start_index:
+                b["index"] = idx + delta
+
+        return json.dumps(data, ensure_ascii=False)
+
+    project.image_paths = _shift_json(project.image_paths)
+    project.image_descriptions = _shift_json(project.image_descriptions)
+    project.image_generation_status = _shift_json(project.image_generation_status)
+
+
+def _clear_images_for_block(project: Project, block_index: int, db: Session):
+    """
+    Удаляет все данные по изображениям для блока с данным index:
+    - записи в ScenarioElementImage
+    - записи в JSON-полях Project.image_paths / image_descriptions / image_generation_status
+    """
+    # 1. Удаляем записи ScenarioElementImage и сами файлы (если есть)
+    element_images = db.query(ScenarioElementImage).filter(
+        ScenarioElementImage.project_id == project.id,
+        ScenarioElementImage.element_index == block_index
+    ).all()
+
+    for img in element_images:
+        if img.image_path and os.path.exists(img.image_path):
+            try:
+                os.remove(img.image_path)
+            except OSError:
+                # Не критично, если файл не удалился
+                pass
+        db.delete(img)
+
+    # 2. Удаляем блок из JSON-полей по index
+    def _remove_from_json(field_value: Optional[str]) -> Optional[str]:
+        if not field_value:
+            return field_value
+        try:
+            data = json.loads(field_value)
+        except (json.JSONDecodeError, TypeError):
+            return field_value
+
+        blocks = data.get("blocks")
+        if not isinstance(blocks, list):
+            return field_value
+
+        data["blocks"] = [b for b in blocks if b.get("index") != block_index]
+        return json.dumps(data, ensure_ascii=False)
+
+    project.image_paths = _remove_from_json(project.image_paths)
+    project.image_descriptions = _remove_from_json(project.image_descriptions)
+    project.image_generation_status = _remove_from_json(project.image_generation_status)
 
 
 def translate_ru_to_en(text: str) -> str:
@@ -196,47 +373,47 @@ class GenerateImageForBlockRequest(BaseModel):
     project_id: int
     block_index: int  # Индекс блока в сценарии (1-нумерация)
 
-@router.post("/generate_image", response_model=GenerateImageResponse)
-async def generate_image_endpoint(
-    request: GenerateImageRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Эндпоинт для генерации изображения
-    Принимает описание изображения, пользователь определяется из JWT
-    """
-    # Создаем запись проекта в БД со статусом "in_progress"
-    project = Project(
-        user_id=current_user.id,
-        status=ProjectStatus.in_progress,
-        image_description=request.image_description
-    )
-    db.add(project)
-    db.commit()
-    db.refresh(project)
+# @router.post("/generate_image", response_model=GenerateImageResponse)
+# async def generate_image_endpoint(
+#     request: GenerateImageRequest,
+#     background_tasks: BackgroundTasks,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     """
+#     Эндпоинт для генерации изображения
+#     Принимает описание изображения, пользователь определяется из JWT
+#     """
+#     # Создаем запись проекта в БД со статусом "in_progress"
+#     project = Project(
+#         user_id=current_user.id,
+#         status=ProjectStatus.in_progress,
+#         image_description=request.image_description
+#     )
+#     db.add(project)
+#     db.commit()
+#     db.refresh(project)
 
-    # Определяем путь для сохранения PNG файла
-    user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-    user_data_dir.mkdir(parents=True, exist_ok=True)
+#     # Определяем путь для сохранения PNG файла
+#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
+#     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
+#     image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
 
-    # Добавляем задачу в фон для генерации изображения
-    background_tasks.add_task(
-        process_image_generation,
-        project.id,
-        request.image_description,
-        str(image_file),
-        db
-    )
+#     # Добавляем задачу в фон для генерации изображения
+#     background_tasks.add_task(
+#         process_image_generation,
+#         project.id,
+#         request.image_description,
+#         str(image_file),
+#         db
+#     )
 
-    return GenerateImageResponse(
-        project_id=project.id,
-        status="in_progress",
-        message=f"Image generation started for project {project.id}"
-    )
+#     return GenerateImageResponse(
+#         project_id=project.id,
+#         status="in_progress",
+#         message=f"Image generation started for project {project.id}"
+#     )
 
 @router.post("/generate_image_for_block", response_model=GenerateImageResponse)
 async def generate_image_for_block_endpoint(
@@ -348,8 +525,8 @@ def process_image_generation(
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     "http://127.0.0.1:3339/generate_image",
-                    json={"prompt": translated_prompt},
-                    timeout=60.0  # таймаут 60 секунд
+                    json={"prompt": translated_prompt}
+                    # timeout=60.0  # таймаут 60 секунд
                 )
 
                 if response.status_code == 200:
@@ -483,62 +660,62 @@ class EditImageRequest(BaseModel):
     image_description: str
 
 
-@router.post("/edit_image", response_model=GenerateImageResponse)
-async def edit_image_endpoint(
-    request: EditImageRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Эндпоинт для редактирования изображения
-    Принимает ID проекта и новое описание изображения
-    """
-    # Проверяем, что проект существует и принадлежит пользователю
-    project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+# @router.post("/edit_image", response_model=GenerateImageResponse)
+# async def edit_image_endpoint(
+#     request: EditImageRequest,
+#     background_tasks: BackgroundTasks,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     """
+#     Эндпоинт для редактирования изображения
+#     Принимает ID проекта и новое описание изображения
+#     """
+#     # Проверяем, что проект существует и принадлежит пользователю
+#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
+#     if not project:
+#         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Проверяем, что у проекта есть изображение для редактирования
-    if not project.image_path or not os.path.exists(project.image_path):
-        raise HTTPException(status_code=404, detail="Original image not found")
+#     # Проверяем, что у проекта есть изображение для редактирования
+#     if not project.image_path or not os.path.exists(project.image_path):
+#         raise HTTPException(status_code=404, detail="Original image not found")
 
-    # Do not change the overall project status, only track image generation status
-    # Update the image description separately (though this endpoint seems to be for general images, not block-specific)
+#     # Do not change the overall project status, only track image generation status
+#     # Update the image description separately (though this endpoint seems to be for general images, not block-specific)
     
-    # For general image editing, we'll still update the old field
-    project.image_description = request.image_description
+#     # For general image editing, we'll still update the old field
+#     project.image_description = request.image_description
 
-    # Set image generation status to in_progress
-    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-    existing_blocks = current_status.get("blocks", [])
+#     # Set image generation status to in_progress
+#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+#     existing_blocks = current_status.get("blocks", [])
 
-    # Since this is a general image (not block-specific), we can't track it properly
-    # However, we need to make sure we don't change the main project status
-    project.image_generation_status = json.dumps({"blocks": existing_blocks})
-    db.commit()
+#     # Since this is a general image (not block-specific), we can't track it properly
+#     # However, we need to make sure we don't change the main project status
+#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
+#     db.commit()
 
-    # Определяем путь для сохранения отредактированного PNG файла
-    user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-    user_data_dir.mkdir(parents=True, exist_ok=True)
+#     # Определяем путь для сохранения отредактированного PNG файла
+#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
+#     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
+#     image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
 
-    # Добавляем задачу в фон для редактирования изображения
-    background_tasks.add_task(
-        process_image_editing,
-        project.id,
-        request.image_description,
-        project.image_path,  # путь к оригинальному изображению
-        str(image_file),
-        db
-    )
+#     # Добавляем задачу в фон для редактирования изображения
+#     background_tasks.add_task(
+#         process_image_editing,
+#         project.id,
+#         request.image_description,
+#         project.image_path,  # путь к оригинальному изображению
+#         str(image_file),
+#         db
+#     )
 
-    return GenerateImageResponse(
-        project_id=project.id,
-        status="in_progress",
-        message=f"Image editing started for project {project.id}"
-    )
+#     return GenerateImageResponse(
+#         project_id=project.id,
+#         status="in_progress",
+#         message=f"Image editing started for project {project.id}"
+#     )
 
 
 def process_image_editing(
@@ -573,8 +750,8 @@ def process_image_editing(
                     json={
                         "prompt": translated_prompt,
                         "image_base64": original_image_base64
-                    },
-                    timeout=180.0  # больший таймаут для редактирования
+                    }
+                    # timeout=420.0  # больший таймаут для редактирования
                 )
 
                 if response.status_code == 200:
@@ -696,433 +873,433 @@ def process_image_editing(
             db.commit()
 
 
-@router.post("/generate_element_images", response_model=GenerateImageResponse)
-async def generate_element_images_endpoint(
-    request: GenerateElementImageRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Эндпоинт для генерации изображений для элементов сценария
-    Принимает ID проекта и индекс элемента (или None для всех элементов)
-    """
-    # Проверяем, что проект существует и принадлежит пользователю
-    project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+# @router.post("/generate_element_images", response_model=GenerateImageResponse)
+# async def generate_element_images_endpoint(
+#     request: GenerateElementImageRequest,
+#     background_tasks: BackgroundTasks,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     """
+#     Эндпоинт для генерации изображений для элементов сценария
+#     Принимает ID проекта и индекс элемента (или None для всех элементов)
+#     """
+#     # Проверяем, что проект существует и принадлежит пользователю
+#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
+#     if not project:
+#         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Проверяем, что проект имеет сценарий
-    if not project.result_path or not os.path.exists(project.result_path):
-        raise HTTPException(status_code=404, detail="Scenario JSON not found")
+#     # Проверяем, что проект имеет сценарий
+#     if not project.result_path or not os.path.exists(project.result_path):
+#         raise HTTPException(status_code=404, detail="Scenario JSON not found")
 
-    # Читаем сценарий из JSON файла
-    with open(project.result_path, 'r', encoding='utf-8') as f:
-        scenario_data = json.load(f)
+#     # Читаем сценарий из JSON файла
+#     with open(project.result_path, 'r', encoding='utf-8') as f:
+#         scenario_data = json.load(f)
 
-    blocks = scenario_data.get('blocks', [])
+#     blocks = scenario_data.get('blocks', [])
 
-    if request.element_index is not None:
-        # Генерируем изображение только для указанного элемента
-        if request.element_index < 1 or request.element_index > len(blocks):
-            raise HTTPException(status_code=400, detail="Invalid element index")
+#     if request.element_index is not None:
+#         # Генерируем изображение только для указанного элемента
+#         if request.element_index < 1 or request.element_index > len(blocks):
+#             raise HTTPException(status_code=400, detail="Invalid element index")
 
-        block = blocks[request.element_index - 1]
-        if block.get('type') != 'action':
-            raise HTTPException(
-                status_code=400,
-                detail="Image generation is allowed only for 'action' blocks"
-            )
+#         block = blocks[request.element_index - 1]
+#         if block.get('type') != 'action':
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="Image generation is allowed only for 'action' blocks"
+#             )
 
-        target_blocks = [block]
-    else:
-        # Генерируем изображения только для action-блоков
-        target_blocks = [b for b in blocks if b.get('type') == 'action']
-        if not target_blocks:
-            raise HTTPException(
-                status_code=400,
-                detail="No 'action' blocks found in scenario"
-            )
+#         target_blocks = [block]
+#     else:
+#         # Генерируем изображения только для action-блоков
+#         target_blocks = [b for b in blocks if b.get('type') == 'action']
+#         if not target_blocks:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="No 'action' blocks found in scenario"
+#             )
 
-    # Определяем директорию для изображений
-    user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-    user_data_dir.mkdir(parents=True, exist_ok=True)
+#     # Определяем директорию для изображений
+#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
+#     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Do not change the overall project status, only track image generation status
-    # Create or update the image generation status for the relevant blocks
+#     # Do not change the overall project status, only track image generation status
+#     # Create or update the image generation status for the relevant blocks
     
-    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-    existing_blocks = current_status.get("blocks", [])
+#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+#     existing_blocks = current_status.get("blocks", [])
 
-    if request.element_index is not None:
-        # For a specific element, update only that block's status
-        block_exists = False
-        for block in existing_blocks:
-            if block.get("index") == request.element_index:
-                block["status"] = ProjectStatus.in_progress.value
-                block_exists = True
-                break
+#     if request.element_index is not None:
+#         # For a specific element, update only that block's status
+#         block_exists = False
+#         for block in existing_blocks:
+#             if block.get("index") == request.element_index:
+#                 block["status"] = ProjectStatus.in_progress.value
+#                 block_exists = True
+#                 break
 
-        if not block_exists:
-            existing_blocks.append({
-                "index": request.element_index,
-                "status": ProjectStatus.in_progress.value
-            })
-    else:
-        # For all elements, update status for all target blocks
-        for block in target_blocks:
-            block_index = block.get('index')
-            block_exists = False
-            for existing_block in existing_blocks:
-                if existing_block.get("index") == block_index:
-                    existing_block["status"] = ProjectStatus.in_progress.value
-                    block_exists = True
-                    break
+#         if not block_exists:
+#             existing_blocks.append({
+#                 "index": request.element_index,
+#                 "status": ProjectStatus.in_progress.value
+#             })
+#     else:
+#         # For all elements, update status for all target blocks
+#         for block in target_blocks:
+#             block_index = block.get('index')
+#             block_exists = False
+#             for existing_block in existing_blocks:
+#                 if existing_block.get("index") == block_index:
+#                     existing_block["status"] = ProjectStatus.in_progress.value
+#                     block_exists = True
+#                     break
 
-            if not block_exists:
-                existing_blocks.append({
-                    "index": block_index,
-                    "status": ProjectStatus.in_progress.value
-                })
+#             if not block_exists:
+#                 existing_blocks.append({
+#                     "index": block_index,
+#                     "status": ProjectStatus.in_progress.value
+#                 })
 
-    project.image_generation_status = json.dumps({"blocks": existing_blocks})
-    db.commit()
+#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
+#     db.commit()
 
-    # Добавляем задачу в фон для генерации изображений для элементов
-    background_tasks.add_task(
-        process_element_images_generation,
-        project.id,
-        request.element_index,
-        target_blocks,
-        str(user_data_dir),
-        db
-    )
+#     # Добавляем задачу в фон для генерации изображений для элементов
+#     background_tasks.add_task(
+#         process_element_images_generation,
+#         project.id,
+#         request.element_index,
+#         target_blocks,
+#         str(user_data_dir),
+#         db
+#     )
 
-    if request.element_index is not None:
-        message = f"Image generation started for element {request.element_index} of project {project.id}"
-    else:
-        message = f"Image generation started for all elements of project {project.id}"
+#     if request.element_index is not None:
+#         message = f"Image generation started for element {request.element_index} of project {project.id}"
+#     else:
+#         message = f"Image generation started for all elements of project {project.id}"
 
-    return GenerateImageResponse(
-        project_id=project.id,
-        status="in_progress",
-        message=message
-    )
+#     return GenerateImageResponse(
+#         project_id=project.id,
+#         status="in_progress",
+#         message=message
+#     )
 
 
-def process_element_images_generation(
-    project_id: int,
-    element_index: Optional[int],
-    target_blocks: list,
-    user_data_dir: str,
-    db: Session
-):
-    """
-    Фоновая задача для генерации изображений для элементов сценария
-    """
-    try:
-        import httpx
-        import asyncio
+# def process_element_images_generation(
+#     project_id: int,
+#     element_index: Optional[int],
+#     target_blocks: list,
+#     user_data_dir: str,
+#     db: Session
+# ):
+#     """
+#     Фоновая задача для генерации изображений для элементов сценария
+#     """
+#     try:
+#         import httpx
+#         import asyncio
         
 
-        # Асинхронная функция для генерации изображений для элементов
-        async def generate_element_images_async():
-            success_count = 0
+#         # Асинхронная функция для генерации изображений для элементов
+#         async def generate_element_images_async():
+#             success_count = 0
 
-            # Prepare data structures to store all image paths and descriptions
-            image_paths_list = []
-            image_descriptions_list = []
-            image_generation_status_list = []
+#             # Prepare data structures to store all image paths and descriptions
+#             image_paths_list = []
+#             image_descriptions_list = []
+#             image_generation_status_list = []
 
-            for block in target_blocks:
-                block_index = block.get('index')
-                block_type = block.get('type')
+#             for block in target_blocks:
+#                 block_index = block.get('index')
+#                 block_type = block.get('type')
 
-                # На всякий случай ещё раз фильтруем
-                if block_type != 'action':
-                    continue
+#                 # На всякий случай ещё раз фильтруем
+#                 if block_type != 'action':
+#                     continue
 
-                block_content = block.get('content', {})
-                description = block_content.get('description', '')
-                image_description = f"Действие: {description}"
+#                 block_content = block.get('content', {})
+#                 description = block_content.get('description', '')
+#                 image_description = f"Действие: {description}"
 
-                output_file_path = f"{user_data_dir}/{project_id}_{block_index}_element_image.png"
+#                 output_file_path = f"{user_data_dir}/{project_id}_{block_index}_element_image.png"
 
-                element_image = ScenarioElementImage(
-                    project_id=project_id,
-                    element_index=block_index,
-                    image_description=image_description,
-                    status=ProjectStatus.in_progress
-                )
-                db.add(element_image)
-                db.commit()
+#                 element_image = ScenarioElementImage(
+#                     project_id=project_id,
+#                     element_index=block_index,
+#                     image_description=image_description,
+#                     status=ProjectStatus.in_progress
+#                 )
+#                 db.add(element_image)
+#                 db.commit()
 
-                try:
-                    translated_prompt = translate_ru_to_en(image_description)
-                    print(f"Translated prompt: {translated_prompt}")
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post(
-                            "http://127.0.0.1:3339/generate_image",
-                            json={"prompt": translated_prompt},
-                            timeout=60.0
-                        )
+#                 try:
+#                     translated_prompt = translate_ru_to_en(image_description)
+#                     print(f"Translated prompt: {translated_prompt}")
+#                     async with httpx.AsyncClient() as client:
+#                         response = await client.post(
+#                             "http://127.0.0.1:3339/generate_image",
+#                             json={"prompt": translated_prompt},
+#                             timeout=60.0
+#                         )
 
-                        if response.status_code == 200:
-                            result = response.json()
-                            image_data = result["image"]
+#                         if response.status_code == 200:
+#                             result = response.json()
+#                             image_data = result["image"]
 
-                            # Декодируем base64 изображение и сохраняем в файл
-                            image_bytes = base64.b64decode(image_data)
-                            with open(output_file_path, "wb") as f:
-                                f.write(image_bytes)
+#                             # Декодируем base64 изображение и сохраняем в файл
+#                             image_bytes = base64.b64decode(image_data)
+#                             with open(output_file_path, "wb") as f:
+#                                 f.write(image_bytes)
 
-                            # Обновляем запись в базе данных
-                            element_image.image_path = output_file_path
-                            element_image.status = ProjectStatus.completed
-                            db.commit()
+#                             # Обновляем запись в базе данных
+#                             element_image.image_path = output_file_path
+#                             element_image.status = ProjectStatus.completed
+#                             db.commit()
 
-                            # Add to our JSON data structures
-                            image_paths_list.append({
-                                "index": block_index,
-                                "image_path": output_file_path
-                            })
-                            image_descriptions_list.append({
-                                "index": block_index,
-                                "image_description": image_description
-                            })
-                            image_generation_status_list.append({
-                                "index": block_index,
-                                "status": ProjectStatus.completed.value
-                            })
+#                             # Add to our JSON data structures
+#                             image_paths_list.append({
+#                                 "index": block_index,
+#                                 "image_path": output_file_path
+#                             })
+#                             image_descriptions_list.append({
+#                                 "index": block_index,
+#                                 "image_description": image_description
+#                             })
+#                             image_generation_status_list.append({
+#                                 "index": block_index,
+#                                 "status": ProjectStatus.completed.value
+#                             })
 
-                            success_count += 1
-                        else:
-                            # Обновляем статус элемента как failed
-                            element_image.status = ProjectStatus.failed
-                            db.commit()
-                            # Add failed status to our JSON data structures
-                            image_generation_status_list.append({
-                                "index": block_index,
-                                "status": ProjectStatus.failed.value
-                            })
-                except Exception as e:
-                    # В случае ошибки обновляем статус элемента как failed
-                    element_image.status = ProjectStatus.failed
-                    db.commit()
-                    # Add failed status to our JSON data structures
-                    image_generation_status_list.append({
-                        "index": block_index,
-                        "status": ProjectStatus.failed.value
-                    })
-                    print(f"Error during image generation for element {block_index}: {e}")
+#                             success_count += 1
+#                         else:
+#                             # Обновляем статус элемента как failed
+#                             element_image.status = ProjectStatus.failed
+#                             db.commit()
+#                             # Add failed status to our JSON data structures
+#                             image_generation_status_list.append({
+#                                 "index": block_index,
+#                                 "status": ProjectStatus.failed.value
+#                             })
+#                 except Exception as e:
+#                     # В случае ошибки обновляем статус элемента как failed
+#                     element_image.status = ProjectStatus.failed
+#                     db.commit()
+#                     # Add failed status to our JSON data structures
+#                     image_generation_status_list.append({
+#                         "index": block_index,
+#                         "status": ProjectStatus.failed.value
+#                     })
+#                     print(f"Error during image generation for element {block_index}: {e}")
 
-            # После завершения всех генераций обновляем статус проекта и сохраняем JSON данные
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project:
-                # Проверяем, есть ли еще элементы в процессе генерации
-                remaining_elements = db.query(ScenarioElementImage).filter(
-                    ScenarioElementImage.project_id == project_id,
-                    ScenarioElementImage.status == ProjectStatus.in_progress
-                ).count()
+#             # После завершения всех генераций обновляем статус проекта и сохраняем JSON данные
+#             project = db.query(Project).filter(Project.id == project_id).first()
+#             if project:
+#                 # Проверяем, есть ли еще элементы в процессе генерации
+#                 remaining_elements = db.query(ScenarioElementImage).filter(
+#                     ScenarioElementImage.project_id == project_id,
+#                     ScenarioElementImage.status == ProjectStatus.in_progress
+#                 ).count()
 
-                if remaining_elements == 0:
-                    # Если все элементы обработаны, обновляем статус проекта
-                    project.status = ProjectStatus.completed
-                    # Сохраняем JSON данные в новые поля
-                    if image_paths_list:
-                        project.image_paths = json.dumps({"blocks": image_paths_list})
-                    if image_descriptions_list:
-                        project.image_descriptions = json.dumps({"blocks": image_descriptions_list})
-                    if image_generation_status_list:
-                        project.image_generation_status = json.dumps({"blocks": image_generation_status_list})
-                    db.commit()
+#                 if remaining_elements == 0:
+#                     # Если все элементы обработаны, обновляем статус проекта
+#                     project.status = ProjectStatus.completed
+#                     # Сохраняем JSON данные в новые поля
+#                     if image_paths_list:
+#                         project.image_paths = json.dumps({"blocks": image_paths_list})
+#                     if image_descriptions_list:
+#                         project.image_descriptions = json.dumps({"blocks": image_descriptions_list})
+#                     if image_generation_status_list:
+#                         project.image_generation_status = json.dumps({"blocks": image_generation_status_list})
+#                     db.commit()
 
-        # Запускаем асинхронную функцию
-        asyncio.run(generate_element_images_async())
+#         # Запускаем асинхронную функцию
+#         asyncio.run(generate_element_images_async())
 
-    except Exception as e:
-        # В случае ошибки обновляем статус генерации изображений как failed
-        print(f"Error during element images generation: {e}")
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
-            # Don't change the main project status, just mark image generation as failed
+#     except Exception as e:
+#         # В случае ошибки обновляем статус генерации изображений как failed
+#         print(f"Error during element images generation: {e}")
+#         project = db.query(Project).filter(Project.id == project_id).first()
+#         if project:
+#             # Don't change the main project status, just mark image generation as failed
             
-            current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-            existing_blocks = current_status.get("blocks", [])
+#             current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+#             existing_blocks = current_status.get("blocks", [])
 
-            # Mark any in-progress blocks as failed for this project
-            for block in existing_blocks:
-                if block.get("status") == ProjectStatus.in_progress.value:
-                    block["status"] = ProjectStatus.failed.value
+#             # Mark any in-progress blocks as failed for this project
+#             for block in existing_blocks:
+#                 if block.get("status") == ProjectStatus.in_progress.value:
+#                     block["status"] = ProjectStatus.failed.value
 
-            project.image_generation_status = json.dumps({"blocks": existing_blocks})
-            db.commit()
+#             project.image_generation_status = json.dumps({"blocks": existing_blocks})
+#             db.commit()
 
 
-@router.post("/edit_element_image", response_model=GenerateImageResponse)
-async def edit_element_image_endpoint(
-    request: EditElementImageRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Эндпоинт для редактирования изображения конкретного элемента сценария
-    Принимает ID проекта, индекс элемента и новое описание изображения
-    """
-    # Проверяем, что проект существует и принадлежит пользователю
-    project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+# @router.post("/edit_element_image", response_model=GenerateImageResponse)
+# async def edit_element_image_endpoint(
+#     request: EditElementImageRequest,
+#     background_tasks: BackgroundTasks,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     """
+#     Эндпоинт для редактирования изображения конкретного элемента сценария
+#     Принимает ID проекта, индекс элемента и новое описание изображения
+#     """
+#     # Проверяем, что проект существует и принадлежит пользователю
+#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
+#     if not project:
+#         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Проверяем, что элемент изображения существует
-    element_image = db.query(ScenarioElementImage).filter(
-        ScenarioElementImage.project_id == request.project_id,
-        ScenarioElementImage.element_index == request.element_index
-    ).first()
+#     # Проверяем, что элемент изображения существует
+#     element_image = db.query(ScenarioElementImage).filter(
+#         ScenarioElementImage.project_id == request.project_id,
+#         ScenarioElementImage.element_index == request.element_index
+#     ).first()
 
-    if not element_image:
-        raise HTTPException(status_code=404, detail="Element image not found")
+#     if not element_image:
+#         raise HTTPException(status_code=404, detail="Element image not found")
 
-    # Проверяем, что у элемента есть изображение для редактирования
-    if not element_image.image_path or not os.path.exists(element_image.image_path):
-        raise HTTPException(status_code=404, detail="Original element image not found")
+#     # Проверяем, что у элемента есть изображение для редактирования
+#     if not element_image.image_path or not os.path.exists(element_image.image_path):
+#         raise HTTPException(status_code=404, detail="Original element image not found")
 
-    # Обновляем статус элемента на "in_progress" и сохраняем новое описание
-    element_image.status = ProjectStatus.in_progress
-    element_image.image_description = request.image_description
-    db.commit()
+#     # Обновляем статус элемента на "in_progress" и сохраняем новое описание
+#     element_image.status = ProjectStatus.in_progress
+#     element_image.image_description = request.image_description
+#     db.commit()
 
-    # Do not change the overall project status, only track image generation status
-    # Create or update the image generation status separately
+#     # Do not change the overall project status, only track image generation status
+#     # Create or update the image generation status separately
     
-    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-    existing_blocks = current_status.get("blocks", [])
+#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+#     existing_blocks = current_status.get("blocks", [])
 
-    # Check if this block already exists in the status list
-    block_exists = False
-    for block in existing_blocks:
-        if block.get("index") == request.element_index:
-            block["status"] = ProjectStatus.in_progress.value
-            block_exists = True
-            break
+#     # Check if this block already exists in the status list
+#     block_exists = False
+#     for block in existing_blocks:
+#         if block.get("index") == request.element_index:
+#             block["status"] = ProjectStatus.in_progress.value
+#             block_exists = True
+#             break
 
-    if not block_exists:
-        existing_blocks.append({
-            "index": request.element_index,
-            "status": ProjectStatus.in_progress.value
-        })
+#     if not block_exists:
+#         existing_blocks.append({
+#             "index": request.element_index,
+#             "status": ProjectStatus.in_progress.value
+#         })
 
-    project.image_generation_status = json.dumps({"blocks": existing_blocks})
-    db.commit()
+#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
+#     db.commit()
 
-    # Добавляем задачу в фон для редактирования изображения элемента
-    background_tasks.add_task(
-        process_element_image_editing,
-        element_image.id,
-        request.image_description,
-        element_image.image_path,  # путь к оригинальному изображению
-        db
-    )
+#     # Добавляем задачу в фон для редактирования изображения элемента
+#     background_tasks.add_task(
+#         process_element_image_editing,
+#         element_image.id,
+#         request.image_description,
+#         element_image.image_path,  # путь к оригинальному изображению
+#         db
+#     )
 
-    return GenerateImageResponse(
-        project_id=project.id,
-        status="in_progress",
-        message=f"Element image editing started for element {request.element_index} of project {project.id}"
-    )
+#     return GenerateImageResponse(
+#         project_id=project.id,
+#         status="in_progress",
+#         message=f"Element image editing started for element {request.element_index} of project {project.id}"
+#     )
 
 
-def process_element_image_editing(
-    element_image_id: int,
-    image_description: str,
-    original_image_path: str,
-    db: Session
-):
-    """
-    Фоновая задача для редактирования изображения конкретного элемента
-    """
-    try:
-        import httpx
-        import asyncio
-        import base64
+# def process_element_image_editing(
+#     element_image_id: int,
+#     image_description: str,
+#     original_image_path: str,
+#     db: Session
+# ):
+#     """
+#     Фоновая задача для редактирования изображения конкретного элемента
+#     """
+#     try:
+#         import httpx
+#         import asyncio
+#         import base64
 
-        # Асинхронная функция для редактирования изображения элемента
-        async def edit_element_image_async():
-            # Читаем оригинальное изображение и кодируем в base64
-            with open(original_image_path, "rb") as f:
-                original_image_bytes = f.read()
-            original_image_base64 = base64.b64encode(original_image_bytes).decode('utf-8')
+#         # Асинхронная функция для редактирования изображения элемента
+#         async def edit_element_image_async():
+#             # Читаем оригинальное изображение и кодируем в base64
+#             with open(original_image_path, "rb") as f:
+#                 original_image_bytes = f.read()
+#             original_image_base64 = base64.b64encode(original_image_bytes).decode('utf-8')
 
-            translated_prompt = translate_ru_to_en(image_description)
-            print(f"Translated prompt: {translated_prompt}")
+#             translated_prompt = translate_ru_to_en(image_description)
+#             print(f"Translated prompt: {translated_prompt}")
             
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "http://127.0.0.1:3339/edit_image",
-                    json={
-                        "prompt": translated_prompt,
-                        "image_base64": original_image_base64
-                    },
-                    timeout=180.0  # больший таймаут для редактирования
-                )
+#             async with httpx.AsyncClient() as client:
+#                 response = await client.post(
+#                     "http://127.0.0.1:3339/edit_image",
+#                     json={
+#                         "prompt": translated_prompt,
+#                         "image_base64": original_image_base64
+#                     },
+#                     timeout=180.0  # больший таймаут для редактирования
+#                 )
 
-                if response.status_code == 200:
-                    result = response.json()
-                    image_data = result["image"]
+#                 if response.status_code == 200:
+#                     result = response.json()
+#                     image_data = result["image"]
 
-                    # Новый путь к изображению (тот же файл, просто перезаписываем)
-                    element_image = db.query(ScenarioElementImage).filter(
-                        ScenarioElementImage.id == element_image_id
-                    ).first()
+#                     # Новый путь к изображению (тот же файл, просто перезаписываем)
+#                     element_image = db.query(ScenarioElementImage).filter(
+#                         ScenarioElementImage.id == element_image_id
+#                     ).first()
 
-                    if element_image:
-                        # Декодируем base64 изображение и сохраняем в файл
-                        image_bytes = base64.b64decode(image_data)
-                        with open(element_image.image_path, "wb") as f:
-                            f.write(image_bytes)
+#                     if element_image:
+#                         # Декодируем base64 изображение и сохраняем в файл
+#                         image_bytes = base64.b64decode(image_data)
+#                         with open(element_image.image_path, "wb") as f:
+#                             f.write(image_bytes)
 
-                        # Обновляем статус элемента на "completed"
-                        element_image.status = ProjectStatus.completed
-                        db.commit()
+#                         # Обновляем статус элемента на "completed"
+#                         element_image.status = ProjectStatus.completed
+#                         db.commit()
 
-                        # Также проверяем, все ли элементы проекта завершены
-                        project = db.query(Project).filter(Project.id == element_image.project_id).first()
-                        if project:
-                            remaining_elements = db.query(ScenarioElementImage).filter(
-                                ScenarioElementImage.project_id == element_image.project_id,
-                                ScenarioElementImage.status == ProjectStatus.in_progress
-                            ).count()
+#                         # Также проверяем, все ли элементы проекта завершены
+#                         project = db.query(Project).filter(Project.id == element_image.project_id).first()
+#                         if project:
+#                             remaining_elements = db.query(ScenarioElementImage).filter(
+#                                 ScenarioElementImage.project_id == element_image.project_id,
+#                                 ScenarioElementImage.status == ProjectStatus.in_progress
+#                             ).count()
 
-                            if remaining_elements == 0:
-                                # Если все элементы обработаны, обновляем статус проекта
-                                project.status = ProjectStatus.completed
-                                db.commit()
+#                             if remaining_elements == 0:
+#                                 # Если все элементы обработаны, обновляем статус проекта
+#                                 project.status = ProjectStatus.completed
+#                                 db.commit()
 
-                    return True
-                else:
-                    # Если произошла ошибка при редактировании, ставим статус "failed"
-                    element_image = db.query(ScenarioElementImage).filter(
-                        ScenarioElementImage.id == element_image_id
-                    ).first()
+#                     return True
+#                 else:
+#                     # Если произошла ошибка при редактировании, ставим статус "failed"
+#                     element_image = db.query(ScenarioElementImage).filter(
+#                         ScenarioElementImage.id == element_image_id
+#                     ).first()
 
-                    if element_image:
-                        element_image.status = ProjectStatus.failed
-                        db.commit()
+#                     if element_image:
+#                         element_image.status = ProjectStatus.failed
+#                         db.commit()
 
-                    return False
+#                     return False
 
-        # Запускаем асинхронную функцию
-        asyncio.run(edit_element_image_async())
+#         # Запускаем асинхронную функцию
+#         asyncio.run(edit_element_image_async())
 
-    except Exception as e:
-        # В случае ошибки обновляем статус элемента как failed
-        print(f"Error during element image editing: {e}")
-        element_image = db.query(ScenarioElementImage).filter(
-            ScenarioElementImage.id == element_image_id
-        ).first()
-        if element_image:
-            element_image.status = ProjectStatus.failed
-            db.commit()
+#     except Exception as e:
+#         # В случае ошибки обновляем статус элемента как failed
+#         print(f"Error during element image editing: {e}")
+#         element_image = db.query(ScenarioElementImage).filter(
+#             ScenarioElementImage.id == element_image_id
+#         ).first()
+#         if element_image:
+#             element_image.status = ProjectStatus.failed
+#             db.commit()
 
 
 @router.post("/edit_image_for_block", response_model=GenerateImageResponse)
@@ -1338,9 +1515,14 @@ async def get_project_images(
     # Собираем информацию о всех изображениях проекта
     images_info = []
 
-    # We no longer have a main project image, only block-specific images
-    # This legacy check is kept for backward compatibility with existing data
-    # but the main project image path is no longer used
+    # Добавляем основное изображение проекта, если оно существует
+    if project.image_path and os.path.exists(project.image_path):
+        images_info.append({
+            "type": "project_main",
+            "path": project.image_path,
+            "description": project.image_description,
+            "created_at": project.created_at
+        })
 
     # Добавляем изображения элементов сценария
     scenario_images = db.query(ScenarioElementImage).filter(
@@ -1423,11 +1605,13 @@ async def get_user_projects(
     for project in projects:
         # Подсчитываем количество изображений у проекта
         images_count = 0
+        if project.image_path and os.path.exists(project.image_path):
+            images_count += 1
 
         element_images_count = db.query(ScenarioElementImage).filter(
             ScenarioElementImage.project_id == project.id
         ).count()
-        images_count = element_images_count
+        images_count += element_images_count
 
         # Parse JSON fields if they exist for structured format
         parsed_image_generation_status = None
@@ -1475,6 +1659,7 @@ async def get_user_projects(
             "has_images": images_count > 0,
             "images_count": images_count,
             "result_path": project.result_path,
+            "image_path": project.image_path,
             "product_description": project.product_description,
             "image_generation_status": parsed_image_generation_status,  # Structured format
             "image_paths": parsed_image_paths,  # Structured format
@@ -1486,4 +1671,712 @@ async def get_user_projects(
         "username": current_user.login,
         "projects_count": len(projects_info),
         "projects": projects_info
+    }
+    
+@router.put("/scenario/{project_id}")
+async def update_scenario(
+    project_id: int,
+    request: ScenarioUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Обновить сценарий проекта:
+    - редактирование / добавление блоков
+    - синхронизация ScenarioElementImage и JSON-полей для картинок
+    """
+    # 1. Проверяем проект и файл сценария
+    project = (
+        db.query(Project)
+        .filter(Project.id == project_id, Project.user_id == current_user.id)
+        .first()
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    if not project.result_path or not os.path.exists(project.result_path):
+        raise HTTPException(status_code=404, detail="Scenario file not found")
+
+    # 2. Читаем текущий JSON сценария
+    try:
+        with open(project.result_path, "r", encoding="utf-8") as f:
+            current_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading scenario file: {str(e)}")
+
+    old_blocks = current_data.get("blocks") or []
+
+    # Мапа старых блоков по index
+    old_by_index: Dict[int, Dict[str, Any]] = {}
+    for b in old_blocks:
+        idx = b.get("index")
+        if isinstance(idx, int):
+            old_by_index[idx] = b
+    old_indices: Set[int] = set(old_by_index.keys())
+
+    # 3. Собираем новые блоки из запроса
+    new_blocks: List[Dict[str, Any]] = []
+    new_by_index: Dict[int, Dict[str, Any]] = {}
+
+    # стартовый max_index для генерации индексов новым блокам
+    max_index = max(old_indices) if old_indices else 0
+
+    for block_model in request.blocks:
+        block_dict = block_model.dict()
+        idx = block_dict.get("index")
+
+        # Новый блок — index не передан
+        if idx is None:
+            max_index += 1
+            idx = max_index
+            block_dict["index"] = idx
+        elif not isinstance(idx, int):
+            raise HTTPException(status_code=400, detail="Block index must be integer")
+
+        if idx in new_by_index:
+            raise HTTPException(status_code=400, detail=f"Duplicate block index {idx} in request")
+
+        new_by_index[idx] = block_dict
+        new_blocks.append(block_dict)
+
+    new_indices: Set[int] = set(new_by_index.keys())
+
+    # 4. Находим удалённые и изменённые блоки
+    common_indices = old_indices & new_indices
+
+    def normalize_block(b: Dict[str, Any]) -> Dict[str, Any]:
+        # Сравниваем только то, что реально важно для смысла блока
+        return {
+            "type": b.get("type"),
+            "content": b.get("content"),
+            "formatting": b.get("formatting"),
+        }
+
+    modified_indices: Set[int] = set()
+    for idx in common_indices:
+        if normalize_block(old_by_index[idx]) != normalize_block(new_by_index[idx]):
+            modified_indices.add(idx)
+
+    # Блоки, которые исчезли из сценария
+    deleted_indices: Set[int] = old_indices - new_indices
+
+    # Для этих индексов удаляем/обнуляем картинки и статусы
+    indices_to_drop_from_images: Set[int] = deleted_indices | modified_indices
+
+    # Индексы, для которых картинки валидны и их можно оставить
+    valid_indices_for_images: Set[int] = new_indices - modified_indices
+
+    # 5. Синхронизация таблицы ScenarioElementImage
+    element_images = (
+        db.query(ScenarioElementImage)
+        .filter(ScenarioElementImage.project_id == project.id)
+        .all()
+    )
+
+    for img in element_images:
+        # Если блока больше нет в сценарии или его содержание изменилось —
+        # удаляем запись и при желании сам файл
+        if img.element_index not in valid_indices_for_images:
+            if img.image_path and os.path.exists(img.image_path):
+                try:
+                    os.remove(img.image_path)
+                except OSError:
+                    pass
+            db.delete(img)
+
+    # 6. Синхронизация JSON-полей с картинками/статусами в Project
+    def sync_json_field(field_value: Optional[str]) -> Optional[str]:
+        """
+        Оставляем в JSON только те блоки, чьи index есть в новом сценарии
+        и блок не был изменён (modified_indices уже исключены).
+        """
+        if not field_value:
+            return field_value
+        try:
+            data = json.loads(field_value)
+        except (json.JSONDecodeError, TypeError):
+            return field_value
+
+        blocks = data.get("blocks")
+        if not isinstance(blocks, list):
+            return field_value
+
+        filtered_blocks = [
+            b for b in blocks
+            if isinstance(b.get("index"), int)
+            and b["index"] in valid_indices_for_images
+        ]
+        data["blocks"] = filtered_blocks
+        return json.dumps(data, ensure_ascii=False)
+
+    project.image_paths = sync_json_field(project.image_paths)
+    project.image_descriptions = sync_json_field(project.image_descriptions)
+    project.image_generation_status = sync_json_field(project.image_generation_status)
+
+    db.commit()
+
+    # 7. Обновляем сам JSON сценария
+    incoming = request.dict(exclude_unset=True)
+
+    product_description = incoming.get(
+        "product_description",
+        current_data.get("product_description", "")
+    )
+
+    original_blocks_count = incoming.get(
+        "original_blocks_count",
+        current_data.get("original_blocks_count")
+    )
+
+    final_blocks_count = len(new_blocks)
+    if original_blocks_count is None:
+        # если вообще нет значения — считаем исходным текущий финальный
+        original_blocks_count = current_data.get("original_blocks_count", final_blocks_count)
+
+    new_data = dict(current_data)
+    new_data["product_description"] = product_description
+    new_data["original_blocks_count"] = original_blocks_count
+    new_data["final_blocks_count"] = final_blocks_count
+    new_data["blocks"] = new_blocks
+
+    try:
+        with open(project.result_path, "w", encoding="utf-8") as f:
+            json.dump(new_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing scenario file: {str(e)}")
+
+    return new_data
+
+@router.post("/scenario/{project_id}/blocks")
+async def add_scenario_block(
+    project_id: int,
+    block_data: ScenarioBlockCreate,
+    position: Optional[int] = Query(
+        None,
+        ge=0,
+        description=(
+            "Позиция вставки в массиве blocks (0-based). "
+            "Если не указана или больше длины массива — блок добавится в конец."
+        ),
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Добавить новый блок в сценарий.
+    - index для блока определяется по позиции: всегда последовательные 1..N
+    - все блоки ПОСЛЕ точки вставки сдвигаются (и их index, и индексы картинок).
+    """
+    # 1. Проверяем проект
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    # 2. Проверяем наличие сценария
+    if not project.result_path or not os.path.exists(project.result_path):
+        raise HTTPException(status_code=404, detail="Scenario file not found")
+
+    # 3. Читаем сценарий
+    try:
+        with open(project.result_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading scenario file: {str(e)}")
+
+    blocks = scenario_data.get("blocks") or []
+    n_before = len(blocks)
+
+    # 4. Определяем позицию вставки (0-based)
+    if position is None or position > n_before:
+        insert_pos = n_before
+    else:
+        insert_pos = position
+
+    # Будущий index нового блока: insert_pos (0-based) -> index = insert_pos + 1
+    new_index = insert_pos + 1
+
+    # 5. Сдвигаем индексы картинок/статусов для блоков с index >= new_index
+    _shift_indices_for_images(project, start_index=new_index, delta=1, db=db)
+
+    # 6. Сдвигаем индексы существующих блоков в сценарии
+    for b in blocks:
+        idx = b.get("index")
+        if isinstance(idx, int) and idx >= new_index:
+            b["index"] = idx + 1
+
+    # 7. Создаём новый блок
+    new_block = {
+        "type": block_data.type,
+        "content": block_data.content,
+        "formatting": block_data.formatting,
+        "index": new_index,
+    }
+
+    blocks.insert(insert_pos, new_block)
+    scenario_data["blocks"] = blocks
+
+    # 8. Обновляем счётчики
+    scenario_data["final_blocks_count"] = len(blocks)
+    if "original_blocks_count" not in scenario_data:
+        scenario_data["original_blocks_count"] = len(blocks)
+
+    # 9. Сохраняем сценарий
+    try:
+        with open(project.result_path, "w", encoding="utf-8") as f:
+            json.dump(scenario_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing scenario file: {str(e)}")
+
+    # 10. Обновим updated_at и закоммитим изменения проекта (JSON-поля уже изменены)
+    project.updated_at = datetime.utcnow()
+    db.add(project)
+    db.commit()
+
+    return {
+        "added_block": new_block,
+        "scenario": scenario_data
+    }
+
+
+@router.patch("/scenario/{project_id}/blocks/{block_index}")
+async def update_scenario_block(
+    project_id: int,
+    block_index: int,
+    block_update: ScenarioBlockUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Частично обновить блок сценария по его index.
+    - индексы блоков НЕ меняются
+    - если меняется содержимое блока типа action (или тип с action на другой),
+      то очищаются все связанные изображения и статусы, чтобы потом вызвать новый generate.
+    """
+    # 1. Проверяем проект
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    if not project.result_path or not os.path.exists(project.result_path):
+        raise HTTPException(status_code=404, detail="Scenario file not found")
+
+    # 2. Читаем сценарий
+    try:
+        with open(project.result_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading scenario file: {str(e)}")
+
+    blocks = scenario_data.get("blocks") or []
+
+    # 3. Ищем блок
+    target_block = None
+    for b in blocks:
+        if b.get("index") == block_index:
+            target_block = b
+            break
+
+    if not target_block:
+        raise HTTPException(status_code=404, detail="Block with given index not found")
+
+    old_type = target_block.get("type")
+    old_content = target_block.get("content")
+
+    # 4. Применяем изменения (partial update)
+    update_data = block_update.dict(exclude_unset=True)
+
+    if "type" in update_data:
+        target_block["type"] = update_data["type"]
+    if "content" in update_data:
+        target_block["content"] = update_data["content"]
+    if "formatting" in update_data:
+        target_block["formatting"] = update_data["formatting"]
+
+    new_type = target_block.get("type")
+    new_content = target_block.get("content")
+
+    # 5. Решаем, нужно ли сбрасывать картинки
+    should_clear_images = False
+
+    if old_type == "action":
+        # Если сменился тип (action -> что-то ещё) или изменился контент блока
+        if new_type != "action" or old_content != new_content:
+            should_clear_images = True
+
+    if should_clear_images:
+        _clear_images_for_block(project, block_index, db)
+        # После этого фронт должен вызвать новый generate для этого блока.
+
+    scenario_data["blocks"] = blocks
+    scenario_data["final_blocks_count"] = len(blocks)
+    if "original_blocks_count" not in scenario_data:
+        scenario_data["original_blocks_count"] = len(blocks)
+
+    # 6. Сохраняем сценарий
+    try:
+        with open(project.result_path, "w", encoding="utf-8") as f:
+            json.dump(scenario_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing scenario file: {str(e)}")
+
+    project.updated_at = datetime.utcnow()
+    db.add(project)
+    db.commit()
+
+    return {
+        "updated_block": target_block,
+        "scenario": scenario_data
+    }
+    
+@router.post("/scenario/{project_id}/blocks/reorder")
+async def reorder_scenario_blocks(
+    project_id: int,
+    reorder_request: ScenarioReorderRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Полностью переупорядочить блоки сценария.
+
+    Тело запроса:
+    {
+      "new_order": [3, 1, 2, 4, ...]  # старые index блоков в новом порядке
+    }
+
+    Логика:
+    - блоки в JSON переставляются согласно new_order
+    - индексы блоков перенумеровываются 1..N в новом порядке
+    - индексы картинок/статусов ремапятся по той же схеме (old_index -> new_index)
+    - сами изображения НЕ удаляются и НЕ регенерируются
+    """
+    # 1. Проверяем проект
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    if not project.result_path or not os.path.exists(project.result_path):
+        raise HTTPException(status_code=404, detail="Scenario file not found")
+
+    # 2. Читаем сценарий
+    try:
+        with open(project.result_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading scenario file: {str(e)}")
+
+    blocks = scenario_data.get("blocks") or []
+    if not blocks:
+        raise HTTPException(status_code=400, detail="Scenario has no blocks to reorder")
+
+    # Список текущих индексов
+    existing_indices = [b.get("index") for b in blocks if isinstance(b.get("index"), int)]
+    if len(existing_indices) != len(blocks):
+        raise HTTPException(status_code=500, detail="Some scenario blocks have no valid index")
+
+    existing_set = set(existing_indices)
+    new_order = reorder_request.new_order
+
+    # 3. Валидация new_order
+    if len(new_order) != len(existing_indices):
+        raise HTTPException(
+            status_code=400,
+            detail="new_order length must match number of blocks"
+        )
+    if set(new_order) != existing_set:
+        raise HTTPException(
+            status_code=400,
+            detail="new_order must be a permutation of existing block indices"
+        )
+
+    # 4. Строим мапу old_index -> block
+    old_by_index: Dict[int, Dict[str, Any]] = {b["index"]: b for b in blocks}
+
+    # 5. Собираем блоки в новом порядке
+    new_blocks: List[Dict[str, Any]] = []
+    index_map: Dict[int, int] = {}  # old_index -> new_index
+
+    for i, old_idx in enumerate(new_order):
+        block = old_by_index[old_idx]
+        new_index = i + 1  # индексы снова подряд 1..N
+        index_map[old_idx] = new_index
+
+        # создаём новый dict, чтобы не запутаться со старыми ссылками
+        new_block = dict(block)
+        new_block["index"] = new_index
+        new_blocks.append(new_block)
+
+    # 6. Обновляем индексы картинок/статусов по той же мапе
+    _remap_indices_for_images(project, index_map, db)
+
+    # 7. Обновляем сценарий
+    scenario_data["blocks"] = new_blocks
+    scenario_data["final_blocks_count"] = len(new_blocks)
+    # original_blocks_count не трогаем — reorder не меняет количество блоков
+
+    # 8. Сохраняем сценарий
+    try:
+        with open(project.result_path, "w", encoding="utf-8") as f:
+            json.dump(scenario_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing scenario file: {str(e)}")
+
+    project.updated_at = datetime.utcnow()
+    db.add(project)
+    db.commit()
+
+    return {
+        "index_map": index_map,   # на всякий случай фронту может пригодиться
+        "scenario": scenario_data
+    }
+
+
+
+@router.delete("/scenario/{project_id}/blocks/{block_index}")
+async def delete_scenario_block(
+    project_id: int,
+    block_index: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Удалить блок сценария по его index.
+    - для удалённого блока полностью чистятся данные по картинкам
+    - все блоки с index > block_index сдвигаются на -1
+      (и в сценарии, и в БД/JSON по картинкам).
+    """
+    # 1. Проверяем проект
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    if not project.result_path or not os.path.exists(project.result_path):
+        raise HTTPException(status_code=404, detail="Scenario file not found")
+
+    # 2. Читаем сценарий
+    try:
+        with open(project.result_path, "r", encoding="utf-8") as f:
+            scenario_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading scenario file: {str(e)}")
+
+    blocks = scenario_data.get("blocks") or []
+    original_len = len(blocks)
+
+    # 3. Ищем позицию блока в массиве по его index
+    delete_pos = None
+    for i, b in enumerate(blocks):
+        if b.get("index") == block_index:
+            delete_pos = i
+            break
+
+    if delete_pos is None:
+        raise HTTPException(status_code=404, detail="Block with given index not found")
+
+    # Удаляем блок из массива
+    blocks.pop(delete_pos)
+
+    # 4. Чистим данные по картинкам для удалённого блока
+    _clear_images_for_block(project, block_index, db)
+
+    # 5. Сдвигаем индексы картинок/статусов для всех блоков, которые были после
+    # (у них старый index > block_index)
+    _shift_indices_for_images(project, start_index=block_index + 1, delta=-1, db=db)
+
+    # 6. Сдвигаем индексы в самом сценарии
+    for b in blocks:
+        idx = b.get("index")
+        if isinstance(idx, int) and idx > block_index:
+            b["index"] = idx - 1
+
+    scenario_data["blocks"] = blocks
+    scenario_data["final_blocks_count"] = len(blocks)
+
+    if "original_blocks_count" not in scenario_data:
+        # если поля не было, считаем исходным количество до удаления
+        scenario_data["original_blocks_count"] = original_len
+
+    # 7. Сохраняем сценарий
+    try:
+        with open(project.result_path, "w", encoding="utf-8") as f:
+            json.dump(scenario_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing scenario file: {str(e)}")
+
+    project.updated_at = datetime.utcnow()
+    db.add(project)
+    db.commit()
+
+    return {
+        "deleted_index": block_index,
+        "scenario": scenario_data
+    }
+
+@router.post("/scenario/{project_id}/blocks/images")
+async def get_images_for_blocks(
+    project_id: int,
+    request: BlocksImagesRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Вернуть КАРТИНКИ для нескольких блоков сразу.
+    Источники:
+    1) scenario_element_images (новая схема)
+    2) project.image_paths (старая схема: JSON с путями до файлов)
+
+    Формат ответа:
+    {
+      "project_id": 1,
+      "results": [
+        {
+          "block_index": 2,
+          "images": [
+            {
+              "image_id": 10,               # может быть None, если из JSON
+              "mime_type": "image/png",
+              "data_base64": "iVBORw0KGgoAAA..."
+            }
+          ]
+        },
+        ...
+      ]
+    }
+    """
+    # 1. Проверяем проект
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+
+    indices = sorted(set(request.block_indices or []))
+    if not indices:
+        return {"project_id": project_id, "results": []}
+
+    # Подготовим структуру для результата
+    grouped: Dict[int, List[dict]] = {idx: [] for idx in indices}
+
+    # Базовая директория проекта (чтобы работать с относительными путями)
+    base_dir = Path(".")  # можно заменить на Path(__file__).resolve().parents[2] при желании
+
+    # --- 2. Сначала пробуем взять картинки из ScenarioElementImage (новая схема) ---
+    images = (
+        db.query(ScenarioElementImage)
+        .filter(
+            ScenarioElementImage.project_id == project.id,
+            ScenarioElementImage.element_index.in_(indices),
+        )
+        .all()
+    )
+
+    seen_paths: Set[str] = set()  # чтобы не дублировать одну и ту же картинку
+
+    for img in images:
+        if not img.image_path:
+            continue
+
+        img_path = Path(img.image_path)
+        if not img_path.is_absolute():
+            img_path = base_dir / img_path
+
+        if not img_path.exists():
+            continue
+
+        try:
+            with open(img_path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+
+        b64 = base64.b64encode(raw).decode("ascii")
+        mime_type, _ = mimetypes.guess_type(str(img_path))
+        if mime_type is None:
+            mime_type = "application/octet-stream"
+
+        norm_path = str(img_path.resolve())
+        seen_paths.add(norm_path)
+
+        grouped.setdefault(img.element_index, []).append(
+            {
+                "image_id": img.id,
+                "mime_type": mime_type,
+                "data_base64": b64,
+            }
+        )
+
+    # --- 3. Дополняем из project.image_paths (старая схема) ---
+    if project.image_paths:
+        try:
+            paths_data = json.loads(project.image_paths)
+            blocks_list = paths_data.get("blocks") or []
+        except (json.JSONDecodeError, TypeError):
+            blocks_list = []
+
+        for entry in blocks_list:
+            idx = entry.get("index")
+            rel_path = entry.get("image_path")
+            if not isinstance(idx, int) or idx not in grouped:
+                continue
+            if not rel_path:
+                continue
+
+            img_path = Path(rel_path)
+            if not img_path.is_absolute():
+                img_path = base_dir / img_path
+
+            if not img_path.exists():
+                continue
+
+            norm_path = str(img_path.resolve())
+            # Если уже брали эту картинку из ScenarioElementImage — пропускаем
+            if norm_path in seen_paths:
+                continue
+
+            try:
+                with open(img_path, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+
+            b64 = base64.b64encode(raw).decode("ascii")
+            mime_type, _ = mimetypes.guess_type(str(img_path))
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+
+            seen_paths.add(norm_path)
+
+            grouped[idx].append(
+                {
+                    "image_id": None,  # из JSON, без отдельной записи в таблице
+                    "mime_type": mime_type,
+                    "data_base64": b64,
+                }
+            )
+
+    # --- 4. Формируем ответ ---
+    results = []
+    for idx in indices:
+        results.append(
+            {
+                "block_index": idx,
+                "images": grouped.get(idx, []),
+            }
+        )
+
+    return {
+        "project_id": project_id,
+        "results": results,
     }
