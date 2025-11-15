@@ -4,3 +4,4 @@
 .env
 umir_db.sqlite
 jumaisynba_script.json
+*/server_plug.py
