@@ -65,9 +65,12 @@ class EditImageForBlockRequest(BaseModel):
 
 from typing import List, Dict, Any
 
-class ImageBlockData(BaseModel):
+class ImagePathData(BaseModel):
     index: int
     image_path: Optional[str] = None
+
+class ImageDescriptionData(BaseModel):
+    index: int
     image_description: Optional[str] = None
 
 class ImageGenerationStatus(BaseModel):
@@ -79,17 +82,15 @@ class ProjectStatusResponse(BaseModel):
     user_id: int
     folder_id: Optional[int]
     project_name: Optional[str]
-    status: str
+    status: str  # This is the project status for scenario generation
     created_at: datetime
     updated_at: Optional[datetime] = None
     result_path: Optional[str] = None
-    image_path: Optional[str] = None
-    image_description: Optional[str] = None
     product_description: Optional[str] = None
     # New structured fields for multiple images
     image_generation_status: Optional[List[ImageGenerationStatus]] = None
-    image_paths: Optional[List[ImageBlockData]] = None
-    image_descriptions: Optional[List[ImageBlockData]] = None
+    image_paths: Optional[List[ImagePathData]] = None
+    image_descriptions: Optional[List[ImageDescriptionData]] = None
 
 
 def translate_ru_to_en(text: str) -> str:
@@ -281,8 +282,27 @@ async def generate_image_for_block_endpoint(
     description = block_content.get('description', '')
     image_description = f"Действие: {description}"
 
-    # Обновляем статус проекта на "in_progress"
-    project.status = ProjectStatus.in_progress
+    # Do not change the overall project status, only track image generation status
+    # Create or update the image generation status separately
+    
+    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+    existing_blocks = current_status.get("blocks", [])
+
+    # Check if this block already exists in the status list
+    block_exists = False
+    for block in existing_blocks:
+        if block.get("index") == request.block_index:
+            block["status"] = ProjectStatus.in_progress.value
+            block_exists = True
+            break
+
+    if not block_exists:
+        existing_blocks.append({
+            "index": request.block_index,
+            "status": ProjectStatus.in_progress.value
+        })
+
+    project.image_generation_status = json.dumps({"blocks": existing_blocks})
     db.commit()
 
     # Определяем путь для сохранения PNG файла
@@ -319,7 +339,7 @@ def process_image_generation(
         # Подключаемся к серверу заглушке для генерации изображения
         import httpx
         import asyncio
-        import json
+        
 
         # Асинхронная функция для генерации изображения
         async def generate_image_async():
@@ -411,8 +431,7 @@ def process_image_generation(
                     # Если произошла ошибка при генерации, ставим статус "failed"
                     project = db.query(Project).filter(Project.id == project_id).first()
                     if project:
-                        project.status = ProjectStatus.failed
-                        # Update status in JSON fields too
+                        # Don't change the main project status, only update image generation status
                         import re
                         match = re.search(r'block_(\d+)_', output_file_path)
                         if match:
@@ -443,7 +462,19 @@ def process_image_generation(
         print(f"Error during image generation: {e}")
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
-            project.status = ProjectStatus.failed
+            # Don't change the main project status, only update image generation status
+            # For general image generation (not block-specific), we still use JSON fields
+            
+            current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+            existing_blocks = current_status.get("blocks", [])
+
+            # Since this is a general image, we may not know the block index from the filename
+            # Mark any in-progress blocks as failed
+            for block in existing_blocks:
+                if block.get("status") == ProjectStatus.in_progress.value:
+                    block["status"] = ProjectStatus.failed.value
+
+            project.image_generation_status = json.dumps({"blocks": existing_blocks})
             db.commit()
 
 
@@ -472,9 +503,19 @@ async def edit_image_endpoint(
     if not project.image_path or not os.path.exists(project.image_path):
         raise HTTPException(status_code=404, detail="Original image not found")
 
-    # Обновляем статус проекта на "in_progress" и сохраняем новое описание
-    project.status = ProjectStatus.in_progress
+    # Do not change the overall project status, only track image generation status
+    # Update the image description separately (though this endpoint seems to be for general images, not block-specific)
+    
+    # For general image editing, we'll still update the old field
     project.image_description = request.image_description
+
+    # Set image generation status to in_progress
+    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+    existing_blocks = current_status.get("blocks", [])
+
+    # Since this is a general image (not block-specific), we can't track it properly
+    # However, we need to make sure we don't change the main project status
+    project.image_generation_status = json.dumps({"blocks": existing_blocks})
     db.commit()
 
     # Определяем путь для сохранения отредактированного PNG файла
@@ -514,7 +555,7 @@ def process_image_editing(
         import httpx
         import asyncio
         import base64
-        import json
+        
         import re
 
         # Асинхронная функция для редактирования изображения
@@ -610,8 +651,7 @@ def process_image_editing(
                     # Если произошла ошибка при редактировании, ставим статус "failed"
                     project = db.query(Project).filter(Project.id == project_id).first()
                     if project:
-                        project.status = ProjectStatus.failed
-                        # Update status in JSON fields too
+                        # Don't change the main project status, only update image generation status
                         match = re.search(r'block_(\d+)_', output_file_path)
                         if match:
                             block_index = int(match.group(1))
@@ -641,7 +681,18 @@ def process_image_editing(
         print(f"Error during image editing: {e}")
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
-            project.status = ProjectStatus.failed
+            # Don't change the main project status, only update image generation status
+            # For general image editing (not block-specific), we still use JSON fields
+            
+            current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+            existing_blocks = current_status.get("blocks", [])
+
+            # Mark any in-progress blocks as failed
+            for block in existing_blocks:
+                if block.get("status") == ProjectStatus.in_progress.value:
+                    block["status"] = ProjectStatus.failed.value
+
+            project.image_generation_status = json.dumps({"blocks": existing_blocks})
             db.commit()
 
 
@@ -697,8 +748,44 @@ async def generate_element_images_endpoint(
     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Обновляем статус проекта на "in_progress"
-    project.status = ProjectStatus.in_progress
+    # Do not change the overall project status, only track image generation status
+    # Create or update the image generation status for the relevant blocks
+    
+    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+    existing_blocks = current_status.get("blocks", [])
+
+    if request.element_index is not None:
+        # For a specific element, update only that block's status
+        block_exists = False
+        for block in existing_blocks:
+            if block.get("index") == request.element_index:
+                block["status"] = ProjectStatus.in_progress.value
+                block_exists = True
+                break
+
+        if not block_exists:
+            existing_blocks.append({
+                "index": request.element_index,
+                "status": ProjectStatus.in_progress.value
+            })
+    else:
+        # For all elements, update status for all target blocks
+        for block in target_blocks:
+            block_index = block.get('index')
+            block_exists = False
+            for existing_block in existing_blocks:
+                if existing_block.get("index") == block_index:
+                    existing_block["status"] = ProjectStatus.in_progress.value
+                    block_exists = True
+                    break
+
+            if not block_exists:
+                existing_blocks.append({
+                    "index": block_index,
+                    "status": ProjectStatus.in_progress.value
+                })
+
+    project.image_generation_status = json.dumps({"blocks": existing_blocks})
     db.commit()
 
     # Добавляем задачу в фон для генерации изображений для элементов
@@ -736,7 +823,7 @@ def process_element_images_generation(
     try:
         import httpx
         import asyncio
-        import json
+        
 
         # Асинхронная функция для генерации изображений для элементов
         async def generate_element_images_async():
@@ -854,11 +941,21 @@ def process_element_images_generation(
         asyncio.run(generate_element_images_async())
 
     except Exception as e:
-        # В случае ошибки обновляем статус проекта как failed
+        # В случае ошибки обновляем статус генерации изображений как failed
         print(f"Error during element images generation: {e}")
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
-            project.status = ProjectStatus.failed
+            # Don't change the main project status, just mark image generation as failed
+            
+            current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+            existing_blocks = current_status.get("blocks", [])
+
+            # Mark any in-progress blocks as failed for this project
+            for block in existing_blocks:
+                if block.get("status") == ProjectStatus.in_progress.value:
+                    block["status"] = ProjectStatus.failed.value
+
+            project.image_generation_status = json.dumps({"blocks": existing_blocks})
             db.commit()
 
 
@@ -896,8 +993,27 @@ async def edit_element_image_endpoint(
     element_image.image_description = request.image_description
     db.commit()
 
-    # Обновляем также статус проекта как в процессе
-    project.status = ProjectStatus.in_progress
+    # Do not change the overall project status, only track image generation status
+    # Create or update the image generation status separately
+    
+    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+    existing_blocks = current_status.get("blocks", [])
+
+    # Check if this block already exists in the status list
+    block_exists = False
+    for block in existing_blocks:
+        if block.get("index") == request.element_index:
+            block["status"] = ProjectStatus.in_progress.value
+            block_exists = True
+            break
+
+    if not block_exists:
+        existing_blocks.append({
+            "index": request.element_index,
+            "status": ProjectStatus.in_progress.value
+        })
+
+    project.image_generation_status = json.dumps({"blocks": existing_blocks})
     db.commit()
 
     # Добавляем задачу в фон для редактирования изображения элемента
@@ -1071,8 +1187,27 @@ async def edit_image_for_block_endpoint(
     if not os.path.exists(original_image_path):
         raise HTTPException(status_code=404, detail="Original image not found. Generate the image first.")
 
-    # Обновляем статус проекта на "in_progress"
-    project.status = ProjectStatus.in_progress
+    # Do not change the overall project status, only track image generation status
+    # Create or update the image generation status separately
+    
+    current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
+    existing_blocks = current_status.get("blocks", [])
+
+    # Check if this block already exists in the status list
+    block_exists = False
+    for block in existing_blocks:
+        if block.get("index") == request.block_index:
+            block["status"] = ProjectStatus.in_progress.value
+            block_exists = True
+            break
+
+    if not block_exists:
+        existing_blocks.append({
+            "index": request.block_index,
+            "status": ProjectStatus.in_progress.value
+        })
+
+    project.image_generation_status = json.dumps({"blocks": existing_blocks})
     db.commit()
 
     # Определяем путь для сохранения отредактированного PNG файла
@@ -1103,7 +1238,7 @@ def get_project_status(
     """
     Получить статус проекта по ID (включая информацию о сценарии и изображении)
     """
-    import json
+    
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1125,7 +1260,10 @@ def get_project_status(
         try:
             paths_data = json.loads(project.image_paths)
             if "blocks" in paths_data:
-                image_paths = [ImageBlockData(**block) for block in paths_data["blocks"]]
+                # Create ImagePathData objects only with index and image_path
+                image_paths = []
+                for block in paths_data["blocks"]:
+                    image_paths.append(ImagePathData(index=block["index"], image_path=block.get("image_path")))
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1133,7 +1271,10 @@ def get_project_status(
         try:
             descriptions_data = json.loads(project.image_descriptions)
             if "blocks" in descriptions_data:
-                image_descriptions = [ImageBlockData(**block) for block in descriptions_data["blocks"]]
+                # Create ImageDescriptionData objects only with index and image_description
+                image_descriptions = []
+                for block in descriptions_data["blocks"]:
+                    image_descriptions.append(ImageDescriptionData(index=block["index"], image_description=block.get("image_description")))
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1146,8 +1287,6 @@ def get_project_status(
         created_at=project.created_at,
         updated_at=project.updated_at,
         result_path=project.result_path,
-        image_path=project.image_path,
-        image_description=project.image_description,
         product_description=project.product_description,
         image_generation_status=image_generation_status,
         image_paths=image_paths,
@@ -1199,14 +1338,9 @@ async def get_project_images(
     # Собираем информацию о всех изображениях проекта
     images_info = []
 
-    # Добавляем основное изображение проекта, если оно существует
-    if project.image_path and os.path.exists(project.image_path):
-        images_info.append({
-            "type": "project_main",
-            "path": project.image_path,
-            "description": project.image_description,
-            "created_at": project.created_at
-        })
+    # We no longer have a main project image, only block-specific images
+    # This legacy check is kept for backward compatibility with existing data
+    # but the main project image path is no longer used
 
     # Добавляем изображения элементов сценария
     scenario_images = db.query(ScenarioElementImage).filter(
@@ -1225,7 +1359,7 @@ async def get_project_images(
                 "updated_at": img.updated_at
             })
 
-    import json
+    
 
     # Parse JSON fields if they exist for structured format
     parsed_image_generation_status = None
@@ -1244,7 +1378,10 @@ async def get_project_images(
         try:
             paths_data = json.loads(project.image_paths)
             if "blocks" in paths_data:
-                parsed_image_paths = [ImageBlockData(**block) for block in paths_data["blocks"]]
+                # Create ImagePathData objects only with index and image_path
+                parsed_image_paths = []
+                for block in paths_data["blocks"]:
+                    parsed_image_paths.append(ImagePathData(index=block["index"], image_path=block.get("image_path")))
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1252,7 +1389,10 @@ async def get_project_images(
         try:
             descriptions_data = json.loads(project.image_descriptions)
             if "blocks" in descriptions_data:
-                parsed_image_descriptions = [ImageBlockData(**block) for block in descriptions_data["blocks"]]
+                # Create ImageDescriptionData objects only with index and image_description
+                parsed_image_descriptions = []
+                for block in descriptions_data["blocks"]:
+                    parsed_image_descriptions.append(ImageDescriptionData(index=block["index"], image_description=block.get("image_description")))
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1275,7 +1415,7 @@ async def get_user_projects(
     """
     Получить все проекты пользователя
     """
-    import json
+    
     # Получаем все проекты пользователя
     projects = db.query(Project).filter(Project.user_id == current_user.id).all()
 
@@ -1283,13 +1423,11 @@ async def get_user_projects(
     for project in projects:
         # Подсчитываем количество изображений у проекта
         images_count = 0
-        if project.image_path and os.path.exists(project.image_path):
-            images_count += 1
 
         element_images_count = db.query(ScenarioElementImage).filter(
             ScenarioElementImage.project_id == project.id
         ).count()
-        images_count += element_images_count
+        images_count = element_images_count
 
         # Parse JSON fields if they exist for structured format
         parsed_image_generation_status = None
@@ -1308,7 +1446,10 @@ async def get_user_projects(
             try:
                 paths_data = json.loads(project.image_paths)
                 if "blocks" in paths_data:
-                    parsed_image_paths = [ImageBlockData(**block) for block in paths_data["blocks"]]
+                    # Create ImagePathData objects only with index and image_path
+                    parsed_image_paths = []
+                    for block in paths_data["blocks"]:
+                        parsed_image_paths.append(ImagePathData(index=block["index"], image_path=block.get("image_path")))
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -1316,7 +1457,10 @@ async def get_user_projects(
             try:
                 descriptions_data = json.loads(project.image_descriptions)
                 if "blocks" in descriptions_data:
-                    parsed_image_descriptions = [ImageBlockData(**block) for block in descriptions_data["blocks"]]
+                    # Create ImageDescriptionData objects only with index and image_description
+                    parsed_image_descriptions = []
+                    for block in descriptions_data["blocks"]:
+                        parsed_image_descriptions.append(ImageDescriptionData(index=block["index"], image_description=block.get("image_description")))
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -1331,7 +1475,6 @@ async def get_user_projects(
             "has_images": images_count > 0,
             "images_count": images_count,
             "result_path": project.result_path,
-            "image_path": project.image_path,
             "product_description": project.product_description,
             "image_generation_status": parsed_image_generation_status,  # Structured format
             "image_paths": parsed_image_paths,  # Structured format

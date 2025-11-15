@@ -57,12 +57,10 @@ class Project(Base):
     name = Column(String, nullable=True)  # Название проекта
     folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)  # ID папки, к которой принадлежит проект
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    status = Column(Enum(ProjectStatus), nullable=False, default=ProjectStatus.in_progress)
+    status = Column(Enum(ProjectStatus), nullable=False, default=ProjectStatus.in_progress)  # Статус генерации сценария
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     result_path = Column(String, nullable=True)  # Путь к сгенерированному JSON файлу
-    image_path = Column(String, nullable=True)  # Путь к основному изображению (устаревшее поле)
-    image_description = Column(Text, nullable=True)  # Описание изображения для генерации (устаревшее поле)
     product_description = Column(Text, nullable=True)  # Описание продукта (промпт для генерации сценария)
     image_generation_status = Column(Text, nullable=True)  # Статус генерации изображений в JSON формате
     image_paths = Column(Text, nullable=True)  # Все пути к изображениям в JSON формате
