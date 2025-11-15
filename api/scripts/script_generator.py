@@ -1,8 +1,8 @@
 from openai import OpenAI
 import os
 import json
-from pydantic import BaseModel, Field
-from typing import List, Literal, Dict, Any, Optional
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Literal, Dict, Any, Optional, Union
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,9 +13,13 @@ client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
+# Базовая "строгая" модель
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # => additionalProperties: false
+
 # 1. Модель для первого этапа - ПЛАНИРОВАНИЕ
-class ScriptPlan(BaseModel):
-    total_blocks: int = Field(..., ge=5, le=20, description="Общее количество блоков в сценарии")
+class ScriptPlan(StrictModel):
+    total_blocks: int = Field(..., ge=8, le=15, description="Общее количество блоков в сценарии")
     block_sequence: List[Literal["scene_heading", "action", "character", "dialogue", "transition"]] = Field(
         ...,
         description="Последовательность типов блоков для сценария"
@@ -23,39 +27,39 @@ class ScriptPlan(BaseModel):
     story_summary: str = Field(..., description="Краткое описание сюжета сценария")
 
 # 2. Модели блоков для второго этапа
-class SceneHeading(BaseModel):
+class SceneHeading(StrictModel):
     location_type: Literal["INT", "EXT", "INT/EXT"]
     location: str
     time: Literal["DAY", "NIGHT", "MORNING", "EVENING"]
 
-class Action(BaseModel):
+class Action(StrictModel):
     description: str
 
-class Character(BaseModel):
+class Character(StrictModel):
     name: str
     parenthetical: Optional[str] = None
 
-class Dialogue(BaseModel):
+class Dialogue(StrictModel):
     text: str
 
-class Transition(BaseModel):
+class Transition(StrictModel):
     transition_type: Literal["CUT TO", "FADE TO", "DISSOLVE TO"]
 
 # 3. Модель для конкретного блока
-class ScriptBlock(BaseModel):
+class ScriptBlock(StrictModel):
     block_type: Literal["scene_heading", "action", "character", "dialogue", "transition"]
-    content: Dict[str, Any]
+    content: Union[SceneHeading, Action, Character, Dialogue, Transition]
 
 # 4. Модель для финального сценария
-class FinalScript(BaseModel):
+class FinalScript(StrictModel):
     blocks: List[ScriptBlock]
 
 # 5. Функция для первого этапа - ПЛАНИРОВАНИЕ
 def create_script_plan(product_description: str) -> ScriptPlan:
     """Создает план сценария с последовательностью блоков"""
-
+    print(f"ЗАДАНЫЙ ПРОМПТ: {product_description}")
     completion = client.beta.chat.completions.parse(
-        model="openai/gpt-oss-20b:free",
+        model="openai/gpt-4.1-nano",
         messages=[
             {
                 "role": "system",
@@ -70,7 +74,7 @@ def create_script_plan(product_description: str) -> ScriptPlan:
                     f"Описание продукта для рекламы:\n{product_description}\n\n"
                     "Создай план сценария, включающий:\n"
                     "1. Общее количество блоков (от 8 до 15)\n"
-                    "2. Последовательность типов блоков (scene_heading, action, character, dialogue, transition)\n"
+                    "2. Последовательность типов блоков (могут быть только: scene_heading, action, character, dialogue, transition)\n"
                     "3. Краткое описание сюжета\n\n"
                     "ВАЖНО: Не добавляй никаких дополнительных полей, только запрашиваемые."
                 )
@@ -92,7 +96,7 @@ def generate_script_blocks(product_description: str, script_plan: ScriptPlan) ->
     ])
 
     completion = client.beta.chat.completions.parse(
-        model="openai/gpt-oss-20b:free",
+        model="openai/gpt-4.1-nano",
         messages=[
             {
                 "role": "system",
@@ -113,7 +117,7 @@ def generate_script_blocks(product_description: str, script_plan: ScriptPlan) ->
                     f"Последовательность блоков:\n{block_sequence_str}\n\n"
                     "Создай JSON сценарий с точным количеством блоков в указанной последовательности. "
                     "Для каждого блока укажи:\n"
-                    "- block_type: тип блока (scene_heading, action, character, dialogue, transition)\n"
+                    "- block_type: тип блока (могут быть только: scene_heading, action, character, dialogue, transition)\n"
                     "- content: содержимое блока в соответствии с его типом\n\n"
                     "ВАЖНО: Строго следуй указанной последовательности и количеству блоков."
                 )
@@ -229,6 +233,7 @@ def generate_ad_script(product_description: str, output_file: str = "final_scrip
 
     try:
         script_plan = create_script_plan(product_description)
+        print(f"ВЕСЬ ПЛАН:\n{script_plan}")
         print(f"✅ План создан успешно!")
         print(f"📊 Количество блоков: {script_plan.total_blocks}")
         print(f"📖 Сюжет: {script_plan.story_summary}")
@@ -243,6 +248,7 @@ def generate_ad_script(product_description: str, output_file: str = "final_scrip
 
     try:
         final_script = generate_script_blocks(product_description, script_plan)
+        print(f"ВСЕ БЛОКИ:\n{final_script}")
         print(f"✅ Блоки сгенерированы успешно!")
         print(f"🧱 Сгенерировано блоков: {len(final_script.blocks)}")
     except Exception as e:

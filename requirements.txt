@@ -19,17 +19,15 @@ typing_extensions
 pillow
 rich
 requests
+python-jose[cryptography]
 
 # fastapi
 # uvicorn
 # python-multipart
 # sqlalchemy
 # passlib[bcrypt]
-# python-jose[cryptography]
 # aspose-words
 # openai
 # python-dotenv
 # pydantic[email]
 # translitua
-# rich
-# asyncio
