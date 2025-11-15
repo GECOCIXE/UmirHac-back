@@ -20,7 +20,6 @@ from pathlib import Path
 
 from deep_translator import GoogleTranslator
 
-# Импорт из других модулей
 from ..schemas.schemas import get_db, User, Folder, Project, ProjectStatus, ScenarioElementImage
 from ..scripts.script_generator import generate_ad_script
 from .dependencies import get_current_user, get_folder_by_id
@@ -40,11 +39,11 @@ class ScenarioBlock(BaseModel):
     type: str
     content: Dict[str, Any]
     formatting: Dict[str, Any]
-    index: Optional[int] = None  # если None — бэкенд выдаст новый index
+    index: Optional[int] = None 
 
 class EditImageForBlockRequest(BaseModel):
     project_id: int
-    block_index: int  # Индекс блока в сценарии (1-нумерация)
+    block_index: int  
     use_block_prompt: bool = True
     custom_prompt: Optional[str] = None
 
@@ -75,12 +74,12 @@ class ScenarioUpdateRequest(BaseModel):
 
 # Модели Pydantic для запросов и ответов
 class GenerateScriptRequest(BaseModel):
-    product_description: str  # Убран user_id, т.к. он будет извлекаться из JWT
-    folder_id: Optional[int] = None  # ID папки, в которую нужно сохранить проект
-    project_name: Optional[str] = None  # Название проекта
+    product_description: str  
+    folder_id: Optional[int] = None 
+    project_name: Optional[str] = None 
 
 class GenerateImageRequest(BaseModel):
-    image_description: str  # Убран user_id, т.к. он будет извлекаться из JWT
+    image_description: str  
 
 class GenerateScriptResponse(BaseModel):
     project_id: int
@@ -94,7 +93,7 @@ class GenerateImageResponse(BaseModel):
 
 class GenerateElementImageRequest(BaseModel):
     project_id: int
-    element_index: Optional[int] = None  # Если None, то генерировать для всех элементов
+    element_index: Optional[int] = None 
 
 class EditElementImageRequest(BaseModel):
     project_id: int
@@ -103,9 +102,9 @@ class EditElementImageRequest(BaseModel):
 
 class EditImageForBlockRequest(BaseModel):
     project_id: int
-    block_index: int  # Индекс блока в сценарии (1-нумерация)
-    use_block_prompt: bool = True  # Если True, использовать промт из блока, иначе - использовать custom_prompt
-    custom_prompt: Optional[str] = None  # Пользовательский промт, если use_block_prompt = False
+    block_index: int
+    use_block_prompt: bool = True  
+    custom_prompt: Optional[str] = None 
 
 
 class ImagePathData(BaseModel):
@@ -125,22 +124,27 @@ class ProjectStatusResponse(BaseModel):
     user_id: int
     folder_id: Optional[int]
     project_name: Optional[str]
-    status: str  # This is the project status for scenario generation
+    status: str  
     created_at: datetime
     updated_at: Optional[datetime] = None
     result_path: Optional[str] = None
-    image_path: Optional[str] = None  # Legacy field
-    image_description: Optional[str] = None  # Legacy field
+    image_path: Optional[str] = None  
+    image_description: Optional[str] = None 
     product_description: Optional[str] = None
-    # New structured fields for multiple images
     image_generation_status: Optional[List[ImageGenerationStatus]] = None
     image_paths: Optional[List[ImagePathData]] = None
     image_descriptions: Optional[List[ImageDescriptionData]] = None
     
 class ScenarioReorderRequest(BaseModel):
-    # список старых index блоков в новом порядке
     new_order: List[int]
+    
+class EditImageRequest(BaseModel):
+    project_id: int
+    image_description: str
 
+class GenerateImageForBlockRequest(BaseModel):
+    project_id: int
+    block_index: int
 
 def _remap_indices_for_images(project: Project, index_map: Dict[int, int], db: Session):
     """
@@ -369,51 +373,6 @@ def process_script_generation(
             project.status = ProjectStatus.failed
             db.commit()
 
-class GenerateImageForBlockRequest(BaseModel):
-    project_id: int
-    block_index: int  # Индекс блока в сценарии (1-нумерация)
-
-# @router.post("/generate_image", response_model=GenerateImageResponse)
-# async def generate_image_endpoint(
-#     request: GenerateImageRequest,
-#     background_tasks: BackgroundTasks,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """
-#     Эндпоинт для генерации изображения
-#     Принимает описание изображения, пользователь определяется из JWT
-#     """
-#     # Создаем запись проекта в БД со статусом "in_progress"
-#     project = Project(
-#         user_id=current_user.id,
-#         status=ProjectStatus.in_progress,
-#         image_description=request.image_description
-#     )
-#     db.add(project)
-#     db.commit()
-#     db.refresh(project)
-
-#     # Определяем путь для сохранения PNG файла
-#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-#     user_data_dir.mkdir(parents=True, exist_ok=True)
-
-#     image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
-
-#     # Добавляем задачу в фон для генерации изображения
-#     background_tasks.add_task(
-#         process_image_generation,
-#         project.id,
-#         request.image_description,
-#         str(image_file),
-#         db
-#     )
-
-#     return GenerateImageResponse(
-#         project_id=project.id,
-#         status="in_progress",
-#         message=f"Image generation started for project {project.id}"
-#     )
 
 @router.post("/generate_image_for_block", response_model=GenerateImageResponse)
 async def generate_image_for_block_endpoint(
@@ -525,8 +484,8 @@ def process_image_generation(
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     "http://127.0.0.1:3339/generate_image",
-                    json={"prompt": translated_prompt}
-                    # timeout=60.0  # таймаут 60 секунд
+                    json={"prompt": translated_prompt},
+                    timeout=6000.0  # таймаут 60 секунд
                 )
 
                 if response.status_code == 200:
@@ -654,70 +613,6 @@ def process_image_generation(
             project.image_generation_status = json.dumps({"blocks": existing_blocks})
             db.commit()
 
-
-class EditImageRequest(BaseModel):
-    project_id: int
-    image_description: str
-
-
-# @router.post("/edit_image", response_model=GenerateImageResponse)
-# async def edit_image_endpoint(
-#     request: EditImageRequest,
-#     background_tasks: BackgroundTasks,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """
-#     Эндпоинт для редактирования изображения
-#     Принимает ID проекта и новое описание изображения
-#     """
-#     # Проверяем, что проект существует и принадлежит пользователю
-#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-#     if not project:
-#         raise HTTPException(status_code=404, detail="Project not found")
-
-#     # Проверяем, что у проекта есть изображение для редактирования
-#     if not project.image_path or not os.path.exists(project.image_path):
-#         raise HTTPException(status_code=404, detail="Original image not found")
-
-#     # Do not change the overall project status, only track image generation status
-#     # Update the image description separately (though this endpoint seems to be for general images, not block-specific)
-    
-#     # For general image editing, we'll still update the old field
-#     project.image_description = request.image_description
-
-#     # Set image generation status to in_progress
-#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-#     existing_blocks = current_status.get("blocks", [])
-
-#     # Since this is a general image (not block-specific), we can't track it properly
-#     # However, we need to make sure we don't change the main project status
-#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
-#     db.commit()
-
-#     # Определяем путь для сохранения отредактированного PNG файла
-#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-#     user_data_dir.mkdir(parents=True, exist_ok=True)
-
-#     image_file = user_data_dir / f"{current_user.id}_{project.id}_image.png"
-
-#     # Добавляем задачу в фон для редактирования изображения
-#     background_tasks.add_task(
-#         process_image_editing,
-#         project.id,
-#         request.image_description,
-#         project.image_path,  # путь к оригинальному изображению
-#         str(image_file),
-#         db
-#     )
-
-#     return GenerateImageResponse(
-#         project_id=project.id,
-#         status="in_progress",
-#         message=f"Image editing started for project {project.id}"
-#     )
-
-
 def process_image_editing(
     project_id: int,
     image_description: str,
@@ -750,8 +645,8 @@ def process_image_editing(
                     json={
                         "prompt": translated_prompt,
                         "image_base64": original_image_base64
-                    }
-                    # timeout=420.0  # больший таймаут для редактирования
+                    },
+                    timeout=6000.0  # больший таймаут для редактирования
                 )
 
                 if response.status_code == 200:
@@ -872,436 +767,6 @@ def process_image_editing(
             project.image_generation_status = json.dumps({"blocks": existing_blocks})
             db.commit()
 
-
-# @router.post("/generate_element_images", response_model=GenerateImageResponse)
-# async def generate_element_images_endpoint(
-#     request: GenerateElementImageRequest,
-#     background_tasks: BackgroundTasks,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """
-#     Эндпоинт для генерации изображений для элементов сценария
-#     Принимает ID проекта и индекс элемента (или None для всех элементов)
-#     """
-#     # Проверяем, что проект существует и принадлежит пользователю
-#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-#     if not project:
-#         raise HTTPException(status_code=404, detail="Project not found")
-
-#     # Проверяем, что проект имеет сценарий
-#     if not project.result_path or not os.path.exists(project.result_path):
-#         raise HTTPException(status_code=404, detail="Scenario JSON not found")
-
-#     # Читаем сценарий из JSON файла
-#     with open(project.result_path, 'r', encoding='utf-8') as f:
-#         scenario_data = json.load(f)
-
-#     blocks = scenario_data.get('blocks', [])
-
-#     if request.element_index is not None:
-#         # Генерируем изображение только для указанного элемента
-#         if request.element_index < 1 or request.element_index > len(blocks):
-#             raise HTTPException(status_code=400, detail="Invalid element index")
-
-#         block = blocks[request.element_index - 1]
-#         if block.get('type') != 'action':
-#             raise HTTPException(
-#                 status_code=400,
-#                 detail="Image generation is allowed only for 'action' blocks"
-#             )
-
-#         target_blocks = [block]
-#     else:
-#         # Генерируем изображения только для action-блоков
-#         target_blocks = [b for b in blocks if b.get('type') == 'action']
-#         if not target_blocks:
-#             raise HTTPException(
-#                 status_code=400,
-#                 detail="No 'action' blocks found in scenario"
-#             )
-
-#     # Определяем директорию для изображений
-#     user_data_dir = Path("api/users_data") / str(current_user.id) / str(project.id)
-#     user_data_dir.mkdir(parents=True, exist_ok=True)
-
-#     # Do not change the overall project status, only track image generation status
-#     # Create or update the image generation status for the relevant blocks
-    
-#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-#     existing_blocks = current_status.get("blocks", [])
-
-#     if request.element_index is not None:
-#         # For a specific element, update only that block's status
-#         block_exists = False
-#         for block in existing_blocks:
-#             if block.get("index") == request.element_index:
-#                 block["status"] = ProjectStatus.in_progress.value
-#                 block_exists = True
-#                 break
-
-#         if not block_exists:
-#             existing_blocks.append({
-#                 "index": request.element_index,
-#                 "status": ProjectStatus.in_progress.value
-#             })
-#     else:
-#         # For all elements, update status for all target blocks
-#         for block in target_blocks:
-#             block_index = block.get('index')
-#             block_exists = False
-#             for existing_block in existing_blocks:
-#                 if existing_block.get("index") == block_index:
-#                     existing_block["status"] = ProjectStatus.in_progress.value
-#                     block_exists = True
-#                     break
-
-#             if not block_exists:
-#                 existing_blocks.append({
-#                     "index": block_index,
-#                     "status": ProjectStatus.in_progress.value
-#                 })
-
-#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
-#     db.commit()
-
-#     # Добавляем задачу в фон для генерации изображений для элементов
-#     background_tasks.add_task(
-#         process_element_images_generation,
-#         project.id,
-#         request.element_index,
-#         target_blocks,
-#         str(user_data_dir),
-#         db
-#     )
-
-#     if request.element_index is not None:
-#         message = f"Image generation started for element {request.element_index} of project {project.id}"
-#     else:
-#         message = f"Image generation started for all elements of project {project.id}"
-
-#     return GenerateImageResponse(
-#         project_id=project.id,
-#         status="in_progress",
-#         message=message
-#     )
-
-
-# def process_element_images_generation(
-#     project_id: int,
-#     element_index: Optional[int],
-#     target_blocks: list,
-#     user_data_dir: str,
-#     db: Session
-# ):
-#     """
-#     Фоновая задача для генерации изображений для элементов сценария
-#     """
-#     try:
-#         import httpx
-#         import asyncio
-        
-
-#         # Асинхронная функция для генерации изображений для элементов
-#         async def generate_element_images_async():
-#             success_count = 0
-
-#             # Prepare data structures to store all image paths and descriptions
-#             image_paths_list = []
-#             image_descriptions_list = []
-#             image_generation_status_list = []
-
-#             for block in target_blocks:
-#                 block_index = block.get('index')
-#                 block_type = block.get('type')
-
-#                 # На всякий случай ещё раз фильтруем
-#                 if block_type != 'action':
-#                     continue
-
-#                 block_content = block.get('content', {})
-#                 description = block_content.get('description', '')
-#                 image_description = f"Действие: {description}"
-
-#                 output_file_path = f"{user_data_dir}/{project_id}_{block_index}_element_image.png"
-
-#                 element_image = ScenarioElementImage(
-#                     project_id=project_id,
-#                     element_index=block_index,
-#                     image_description=image_description,
-#                     status=ProjectStatus.in_progress
-#                 )
-#                 db.add(element_image)
-#                 db.commit()
-
-#                 try:
-#                     translated_prompt = translate_ru_to_en(image_description)
-#                     print(f"Translated prompt: {translated_prompt}")
-#                     async with httpx.AsyncClient() as client:
-#                         response = await client.post(
-#                             "http://127.0.0.1:3339/generate_image",
-#                             json={"prompt": translated_prompt},
-#                             timeout=60.0
-#                         )
-
-#                         if response.status_code == 200:
-#                             result = response.json()
-#                             image_data = result["image"]
-
-#                             # Декодируем base64 изображение и сохраняем в файл
-#                             image_bytes = base64.b64decode(image_data)
-#                             with open(output_file_path, "wb") as f:
-#                                 f.write(image_bytes)
-
-#                             # Обновляем запись в базе данных
-#                             element_image.image_path = output_file_path
-#                             element_image.status = ProjectStatus.completed
-#                             db.commit()
-
-#                             # Add to our JSON data structures
-#                             image_paths_list.append({
-#                                 "index": block_index,
-#                                 "image_path": output_file_path
-#                             })
-#                             image_descriptions_list.append({
-#                                 "index": block_index,
-#                                 "image_description": image_description
-#                             })
-#                             image_generation_status_list.append({
-#                                 "index": block_index,
-#                                 "status": ProjectStatus.completed.value
-#                             })
-
-#                             success_count += 1
-#                         else:
-#                             # Обновляем статус элемента как failed
-#                             element_image.status = ProjectStatus.failed
-#                             db.commit()
-#                             # Add failed status to our JSON data structures
-#                             image_generation_status_list.append({
-#                                 "index": block_index,
-#                                 "status": ProjectStatus.failed.value
-#                             })
-#                 except Exception as e:
-#                     # В случае ошибки обновляем статус элемента как failed
-#                     element_image.status = ProjectStatus.failed
-#                     db.commit()
-#                     # Add failed status to our JSON data structures
-#                     image_generation_status_list.append({
-#                         "index": block_index,
-#                         "status": ProjectStatus.failed.value
-#                     })
-#                     print(f"Error during image generation for element {block_index}: {e}")
-
-#             # После завершения всех генераций обновляем статус проекта и сохраняем JSON данные
-#             project = db.query(Project).filter(Project.id == project_id).first()
-#             if project:
-#                 # Проверяем, есть ли еще элементы в процессе генерации
-#                 remaining_elements = db.query(ScenarioElementImage).filter(
-#                     ScenarioElementImage.project_id == project_id,
-#                     ScenarioElementImage.status == ProjectStatus.in_progress
-#                 ).count()
-
-#                 if remaining_elements == 0:
-#                     # Если все элементы обработаны, обновляем статус проекта
-#                     project.status = ProjectStatus.completed
-#                     # Сохраняем JSON данные в новые поля
-#                     if image_paths_list:
-#                         project.image_paths = json.dumps({"blocks": image_paths_list})
-#                     if image_descriptions_list:
-#                         project.image_descriptions = json.dumps({"blocks": image_descriptions_list})
-#                     if image_generation_status_list:
-#                         project.image_generation_status = json.dumps({"blocks": image_generation_status_list})
-#                     db.commit()
-
-#         # Запускаем асинхронную функцию
-#         asyncio.run(generate_element_images_async())
-
-#     except Exception as e:
-#         # В случае ошибки обновляем статус генерации изображений как failed
-#         print(f"Error during element images generation: {e}")
-#         project = db.query(Project).filter(Project.id == project_id).first()
-#         if project:
-#             # Don't change the main project status, just mark image generation as failed
-            
-#             current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-#             existing_blocks = current_status.get("blocks", [])
-
-#             # Mark any in-progress blocks as failed for this project
-#             for block in existing_blocks:
-#                 if block.get("status") == ProjectStatus.in_progress.value:
-#                     block["status"] = ProjectStatus.failed.value
-
-#             project.image_generation_status = json.dumps({"blocks": existing_blocks})
-#             db.commit()
-
-
-# @router.post("/edit_element_image", response_model=GenerateImageResponse)
-# async def edit_element_image_endpoint(
-#     request: EditElementImageRequest,
-#     background_tasks: BackgroundTasks,
-#     db: Session = Depends(get_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     """
-#     Эндпоинт для редактирования изображения конкретного элемента сценария
-#     Принимает ID проекта, индекс элемента и новое описание изображения
-#     """
-#     # Проверяем, что проект существует и принадлежит пользователю
-#     project = db.query(Project).filter(Project.id == request.project_id, Project.user_id == current_user.id).first()
-#     if not project:
-#         raise HTTPException(status_code=404, detail="Project not found")
-
-#     # Проверяем, что элемент изображения существует
-#     element_image = db.query(ScenarioElementImage).filter(
-#         ScenarioElementImage.project_id == request.project_id,
-#         ScenarioElementImage.element_index == request.element_index
-#     ).first()
-
-#     if not element_image:
-#         raise HTTPException(status_code=404, detail="Element image not found")
-
-#     # Проверяем, что у элемента есть изображение для редактирования
-#     if not element_image.image_path or not os.path.exists(element_image.image_path):
-#         raise HTTPException(status_code=404, detail="Original element image not found")
-
-#     # Обновляем статус элемента на "in_progress" и сохраняем новое описание
-#     element_image.status = ProjectStatus.in_progress
-#     element_image.image_description = request.image_description
-#     db.commit()
-
-#     # Do not change the overall project status, only track image generation status
-#     # Create or update the image generation status separately
-    
-#     current_status = json.loads(project.image_generation_status) if project.image_generation_status else {"blocks": []}
-#     existing_blocks = current_status.get("blocks", [])
-
-#     # Check if this block already exists in the status list
-#     block_exists = False
-#     for block in existing_blocks:
-#         if block.get("index") == request.element_index:
-#             block["status"] = ProjectStatus.in_progress.value
-#             block_exists = True
-#             break
-
-#     if not block_exists:
-#         existing_blocks.append({
-#             "index": request.element_index,
-#             "status": ProjectStatus.in_progress.value
-#         })
-
-#     project.image_generation_status = json.dumps({"blocks": existing_blocks})
-#     db.commit()
-
-#     # Добавляем задачу в фон для редактирования изображения элемента
-#     background_tasks.add_task(
-#         process_element_image_editing,
-#         element_image.id,
-#         request.image_description,
-#         element_image.image_path,  # путь к оригинальному изображению
-#         db
-#     )
-
-#     return GenerateImageResponse(
-#         project_id=project.id,
-#         status="in_progress",
-#         message=f"Element image editing started for element {request.element_index} of project {project.id}"
-#     )
-
-
-# def process_element_image_editing(
-#     element_image_id: int,
-#     image_description: str,
-#     original_image_path: str,
-#     db: Session
-# ):
-#     """
-#     Фоновая задача для редактирования изображения конкретного элемента
-#     """
-#     try:
-#         import httpx
-#         import asyncio
-#         import base64
-
-#         # Асинхронная функция для редактирования изображения элемента
-#         async def edit_element_image_async():
-#             # Читаем оригинальное изображение и кодируем в base64
-#             with open(original_image_path, "rb") as f:
-#                 original_image_bytes = f.read()
-#             original_image_base64 = base64.b64encode(original_image_bytes).decode('utf-8')
-
-#             translated_prompt = translate_ru_to_en(image_description)
-#             print(f"Translated prompt: {translated_prompt}")
-            
-#             async with httpx.AsyncClient() as client:
-#                 response = await client.post(
-#                     "http://127.0.0.1:3339/edit_image",
-#                     json={
-#                         "prompt": translated_prompt,
-#                         "image_base64": original_image_base64
-#                     },
-#                     timeout=180.0  # больший таймаут для редактирования
-#                 )
-
-#                 if response.status_code == 200:
-#                     result = response.json()
-#                     image_data = result["image"]
-
-#                     # Новый путь к изображению (тот же файл, просто перезаписываем)
-#                     element_image = db.query(ScenarioElementImage).filter(
-#                         ScenarioElementImage.id == element_image_id
-#                     ).first()
-
-#                     if element_image:
-#                         # Декодируем base64 изображение и сохраняем в файл
-#                         image_bytes = base64.b64decode(image_data)
-#                         with open(element_image.image_path, "wb") as f:
-#                             f.write(image_bytes)
-
-#                         # Обновляем статус элемента на "completed"
-#                         element_image.status = ProjectStatus.completed
-#                         db.commit()
-
-#                         # Также проверяем, все ли элементы проекта завершены
-#                         project = db.query(Project).filter(Project.id == element_image.project_id).first()
-#                         if project:
-#                             remaining_elements = db.query(ScenarioElementImage).filter(
-#                                 ScenarioElementImage.project_id == element_image.project_id,
-#                                 ScenarioElementImage.status == ProjectStatus.in_progress
-#                             ).count()
-
-#                             if remaining_elements == 0:
-#                                 # Если все элементы обработаны, обновляем статус проекта
-#                                 project.status = ProjectStatus.completed
-#                                 db.commit()
-
-#                     return True
-#                 else:
-#                     # Если произошла ошибка при редактировании, ставим статус "failed"
-#                     element_image = db.query(ScenarioElementImage).filter(
-#                         ScenarioElementImage.id == element_image_id
-#                     ).first()
-
-#                     if element_image:
-#                         element_image.status = ProjectStatus.failed
-#                         db.commit()
-
-#                     return False
-
-#         # Запускаем асинхронную функцию
-#         asyncio.run(edit_element_image_async())
-
-#     except Exception as e:
-#         # В случае ошибки обновляем статус элемента как failed
-#         print(f"Error during element image editing: {e}")
-#         element_image = db.query(ScenarioElementImage).filter(
-#             ScenarioElementImage.id == element_image_id
-#         ).first()
-#         if element_image:
-#             element_image.status = ProjectStatus.failed
-#             db.commit()
-
-
 @router.post("/edit_image_for_block", response_model=GenerateImageResponse)
 async def edit_image_for_block_endpoint(
     request: EditImageForBlockRequest,
@@ -1405,7 +870,6 @@ async def edit_image_for_block_endpoint(
         status="in_progress",
         message=f"Image editing started for block {request.block_index} of project {project.id}"
     )
-
 
 @router.get("/status/{project_id}", response_model=ProjectStatusResponse)
 def get_project_status(
@@ -2137,8 +1601,6 @@ async def reorder_scenario_blocks(
         "index_map": index_map,   # на всякий случай фронту может пригодиться
         "scenario": scenario_data
     }
-
-
 
 @router.delete("/scenario/{project_id}/blocks/{block_index}")
 async def delete_scenario_block(
